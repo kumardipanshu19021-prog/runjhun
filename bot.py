@@ -237,6 +237,11 @@ BUTTON_DEFAULTS = {
     "ui_a_premium_test": {"label":"Premium Button Test", "normal_emoji":"🧪", "premium_emoji_id":EMOJI["🌟"], "premium_enabled":True, "style":"success", "callback_data":"a_premium_test", "url":None, "position":12, "enabled":True},
     "ui_a_errors": {"label":"Error Log", "normal_emoji":"📜", "premium_emoji_id":EMOJI["📝"], "premium_enabled":True, "style":"primary", "callback_data":"a_errors", "url":None, "position":13, "enabled":True},
     "ui_a_close": {"label":"Close", "normal_emoji":"❌", "premium_emoji_id":EMOJI["❌"], "premium_enabled":True, "style":"danger", "callback_data":"a_close", "url":None, "position":14, "enabled":True},
+    # Global Back button configuration. Every Back button in the bot uses this key,
+    # so its name, normal emoji, premium custom emoji, style and enabled state can
+    # be managed from the same Admin > Buttons screen. Callback data is overridden
+    # per destination and therefore remains unchanged.
+    "ui_back": {"label":"Back", "normal_emoji":"🔙", "premium_emoji_id":EMOJI["📌"], "premium_enabled":True, "style":"primary", "callback_data":"a_back", "url":None, "position":15, "enabled":True},
 }
 BUTTON_STYLES = ("primary", "success", "danger")
 BUTTON_CONFIG_PREFIX = "button_cfg_"
@@ -459,7 +464,7 @@ async def referral_text(bot, uid):
 
 def referral_kb(link):
     share_url=("https://t.me/share/url?url="+quote(link,safe=""))+"&text="+quote("Join this bot using my referral link!",safe="")
-    return InlineKeyboardMarkup([[ib("📤 Share Referral Link",url=share_url,style="success",emoji_id=EMOJI["📣"])],[ib("🔙 Back","back_main",style="primary",emoji_id=EMOJI["📌"])]] )
+    return InlineKeyboardMarkup([[ib("📤 Share Referral Link",url=share_url,style="success",emoji_id=EMOJI["📣"])],[back_button("back_main")]] )
 
 async def show_referral(update,ctx):
     uid=update.effective_user.id
@@ -497,8 +502,12 @@ def main_kb():
     for i in range(0,len(buttons),2): rows.append(buttons[i:i+2])
     return InlineKeyboardMarkup(rows)
 
+def back_button(callback_data="a_back"):
+    """Build the globally configurable Back button with a per-screen callback."""
+    return render_button("ui_back", callback_data=callback_data) or ib("🔙 Back", callback_data, style="primary", emoji_id=EMOJI["📌"])
+
 def back_kb(cb="a_back"):
-    return InlineKeyboardMarkup([[ib("🔙 Back",cb,style="primary",emoji_id=EMOJI["📌"])]] )
+    return InlineKeyboardMarkup([[back_button(cb)]])
 
 def join_kb(rows,joined):
     a=[];b=[]
@@ -616,7 +625,7 @@ def ch_kb():
         cid,name,en=r[0],r[2],r[6]
         rows += [[ib("✏️ "+name[:16],f"a_editc_{cid}",style="primary",emoji_id=EMOJI["📝"]),ib("⬅️",f"a_left_{cid}",style="primary",emoji_id=EMOJI["📌"]),ib("➡️",f"a_right_{cid}",style="primary",emoji_id=EMOJI["📌"])],
                  [ib("🟢 Enable" if not en else "🔴 Disable",f"a_togglec_{cid}",style="success" if not en else "danger",emoji_id=EMOJI["✅"] if not en else EMOJI["❌"]),ib("🧪 Test",f"a_testc_{cid}",style="success",emoji_id=EMOJI["🌟"]),ib("🗑 Delete",f"a_delc_{cid}",style="danger",emoji_id=EMOJI["❌"])]]
-    rows += [[ib("➕ Add Channel","a_addch",style="success",emoji_id=EMOJI["➕"])],[ib("🔙 Back","a_back",style="primary",emoji_id=EMOJI["📌"])]]
+    rows += [[ib("➕ Add Channel","a_addch",style="success",emoji_id=EMOJI["➕"])],[back_button("a_back")]]
     return InlineKeyboardMarkup(rows)
 
 async def show_channels(q):
@@ -633,7 +642,7 @@ def msg_kb():
         [ib("✉️ "+_legacy_names("btn1"),"a_btn1",style="primary",emoji_id=EMOJI["🎯"])],
         [ib("✉️ "+_legacy_names("btn2"),"a_btn2",style="success",emoji_id=EMOJI["📊"])],
         [ib("✉️ "+_legacy_names("btn3"),"a_btn3",style="primary",emoji_id=EMOJI["🤝"])],
-        [ib("🔙 Back","a_back",style="primary",emoji_id=EMOJI["📌"])]
+        [back_button("a_back")]
     ])
 
 def button_config_text(key):
@@ -652,7 +661,7 @@ def btn_kb():
           [ib("👤 Public Buttons","a_public_buttons",style="primary",emoji_id=EMOJI["🎯"]), ib("🛠 Admin Buttons","a_admin_buttons",style="success",emoji_id=EMOJI["⚙️"])],
           [ib("♻️ Reset All Buttons","a_reset_all",style="danger",emoji_id=EMOJI["❌"])],
           [ib("🧪 Premium Button Test","a_premium_test",style="success",emoji_id=EMOJI["🌟"])],
-          [ib("🔙 Back","a_back",style="primary",emoji_id=EMOJI["📌"])]]
+          [back_button("a_back")]]
     return InlineKeyboardMarkup(rows)
 
 def button_list_kb(prefix):
@@ -662,7 +671,7 @@ def button_list_kb(prefix):
         cfg=get_button_config(key)
         rows.append([ib((cfg.get("normal_emoji") or "🔘")+" "+cfg["label"][:22],f"a_editbutton_{key}",style=cfg["style"],emoji_id=cfg.get("premium_emoji_id") if cfg.get("premium_enabled") else None)])
     rows.append([ib("➕ Show Disabled","a_show_disabled_"+prefix,style="primary",emoji_id=EMOJI["📌"])])
-    rows.append([ib("🔙 Back","a_buttons",style="primary",emoji_id=EMOJI["📌"])])
+    rows.append([back_button("a_buttons")])
     return InlineKeyboardMarkup(rows)
 
 def button_editor_kb(key):
@@ -675,7 +684,7 @@ def button_editor_kb(key):
         [ib("🟢 Enabled" if cfg.get("enabled") else "🔴 Disabled","a_enable_"+key,style="success" if cfg.get("enabled") else "danger",emoji_id=EMOJI["✅"] if cfg.get("enabled") else EMOJI["❌"])],
         [ib("👁 Preview","a_preview_"+key,style="primary",emoji_id=EMOJI["📌"]),ib("🧪 Test","a_testbutton_"+key,style="success",emoji_id=EMOJI["🌟"])],
         [ib("↩️ Reset","a_reset_"+key,style="danger",emoji_id=EMOJI["❌"])],
-        [ib("🔙 Back","a_public_buttons" if not key.startswith("ui_") else "a_admin_buttons",style="primary",emoji_id=EMOJI["📌"])]
+        [back_button("a_public_buttons" if not key.startswith("ui_") else "a_admin_buttons")]
     ])
 
 def render_button_editor_text(key):
@@ -685,7 +694,7 @@ def render_button_editor_text(key):
 def settings_kb():
     def t(k,n):
         on=gset(k,"0")=="1";return ib(("🟢 " if on else "🔴 ")+n+": "+("ON" if on else "OFF"),"a_toggle_"+k,style="success" if on else "danger",emoji_id=EMOJI["✅"] if on else EMOJI["❌"])
-    return InlineKeyboardMarkup([[t("maintenance_mode","Maintenance Mode")],[t("force_join_enabled","Force Join")],[t("welcome_photo_enabled","Welcome Photo")],[t("broadcast_enabled","Broadcast")],[t("auto_backup_enabled","Auto Backup")],[t("debug_logging","Debug Logging")],[ib("🕒 Auto Backup: "+gset("auto_backup_frequency","daily"),"a_autobackup",style="primary",emoji_id=EMOJI["🔔"])],[ib("🔙 Back","a_back",style="primary",emoji_id=EMOJI["📌"])]] )
+    return InlineKeyboardMarkup([[t("maintenance_mode","Maintenance Mode")],[t("force_join_enabled","Force Join")],[t("welcome_photo_enabled","Welcome Photo")],[t("broadcast_enabled","Broadcast")],[t("auto_backup_enabled","Auto Backup")],[t("debug_logging","Debug Logging")],[ib("🕒 Auto Backup: "+gset("auto_backup_frequency","daily"),"a_autobackup",style="primary",emoji_id=EMOJI["🔔"])],[back_button("a_back")]] )
 
 def health():
     up=int(time.monotonic()-STARTED_AT)
@@ -821,7 +830,7 @@ async def run_broadcast(bot,admin_chat,msg,bid,recipient_list,status_msg):
             except TelegramError:pass
         await asyncio.sleep(.08)
     status="cancelled" if cancelled else "completed";bcast_update(bid,sent,failed,cancelled,status)
-    kb=InlineKeyboardMarkup([[ib("🔁 Retry Failed",f"a_retrybc_{bid}",style="success",emoji_id=EMOJI["🌟"])],[ib("🗑 Delete Broadcast",f"a_delbc_{bid}",style="danger",emoji_id=EMOJI["❌"])],[ib("🔙 Back","a_bcast",style="primary",emoji_id=EMOJI["📌"])]])
+    kb=InlineKeyboardMarkup([[ib("🔁 Retry Failed",f"a_retrybc_{bid}",style="success",emoji_id=EMOJI["🌟"])],[ib("🗑 Delete Broadcast",f"a_delbc_{bid}",style="danger",emoji_id=EMOJI["❌"])],[back_button("a_bcast")]])
     try:await status_msg.edit_text(f"{'⏹' if cancelled else '✅'} <b>Broadcast {status.title()}</b>\n\n📤 Total: <b>{len(recipient_list)}</b>\n✅ Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>",reply_markup=kb,parse_mode=ParseMode.HTML)
     except TelegramError:pass
 
@@ -859,14 +868,14 @@ async def s_btn3(u,c):return ConversationHandler.END if await input_text(u,c,"bt
 
 async def s_photo(u,c):
     if u.message.text and u.message.text.strip().lower()=="clear":sset("welcome_photo","");await u.message.reply_text("✅ Welcome photo cleared.",reply_markup=back_kb("a_msgs"));return ConversationHandler.END
-    if not u.message.photo:await u.message.reply_text("❌ Send a photo or 'clear'.");return S_WELCOME_PHOTO
+    if not u.message.photo:await u.message.reply_text("❌ Send a photo or 'clear'.",reply_markup=back_kb("a_msgs"));return S_WELCOME_PHOTO
     sset("welcome_photo",u.message.photo[-1].file_id);await u.message.reply_text("✅ Welcome photo updated.",reply_markup=back_kb("a_msgs"));return ConversationHandler.END
 
-async def s_ch_id(u,c):c.user_data["ch_id"]=(u.message.text or "").strip();await u.message.reply_text("✏️ Send Channel Name:");return S_CH_NAME
-async def s_ch_name(u,c):c.user_data["ch_name"]=(u.message.text or "").strip();await u.message.reply_text("🔗 Send Channel Invite Link:");return S_CH_LINK
+async def s_ch_id(u,c):c.user_data["ch_id"]=(u.message.text or "").strip();await u.message.reply_text("✏️ Send Channel Name:",reply_markup=back_kb("a_chs"));return S_CH_NAME
+async def s_ch_name(u,c):c.user_data["ch_name"]=(u.message.text or "").strip();await u.message.reply_text("🔗 Send Channel Invite Link:",reply_markup=back_kb("a_chs"));return S_CH_LINK
 async def s_ch_link(u,c):
     link=(u.message.text or "").strip()
-    if not link.startswith(("https://t.me/","http://t.me/")):await u.message.reply_text("❌ Invalid Telegram link.");return S_CH_LINK
+    if not link.startswith(("https://t.me/","http://t.me/")):await u.message.reply_text("❌ Invalid Telegram link.",reply_markup=back_kb("a_chs"));return S_CH_LINK
     try:add_channel(c.user_data["ch_id"],c.user_data["ch_name"],link)
     except sqlite3.IntegrityError:await u.message.reply_text("❌ Channel already exists.");return ConversationHandler.END
     c.user_data.clear();await u.message.reply_text("✅ Channel added.",reply_markup=back_kb("a_chs"));return ConversationHandler.END
@@ -874,11 +883,11 @@ async def s_ch_link(u,c):
 async def s_editname(u,c):
     cid=c.user_data.get("edit_channel")
     if not cid:return ConversationHandler.END
-    update_channel(cid,name=(u.message.text or "").strip());await u.message.reply_text("🔗 Send new invite link or <code>skip</code>.",parse_mode=ParseMode.HTML);return S_EDITLINK
+    update_channel(cid,name=(u.message.text or "").strip());await u.message.reply_text("🔗 Send new invite link or <code>skip</code>.",reply_markup=back_kb("a_chs"),parse_mode=ParseMode.HTML);return S_EDITLINK
 async def s_editlink(u,c):
     cid=c.user_data.get("edit_channel");v=(u.message.text or "").strip()
     if v.lower()!="skip":
-        if not v.startswith(("https://t.me/","http://t.me/")):await u.message.reply_text("❌ Invalid Telegram link.");return S_EDITLINK
+        if not v.startswith(("https://t.me/","http://t.me/")):await u.message.reply_text("❌ Invalid Telegram link.",reply_markup=back_kb("a_chs"));return S_EDITLINK
         update_channel(cid,link=v)
     c.user_data.clear();await u.message.reply_text("✅ Channel updated.",reply_markup=back_kb("a_chs"));return ConversationHandler.END
 
@@ -1009,7 +1018,7 @@ async def admin_cb(update,ctx):
                 [ib("🚫 Block",f"a_blocku_{uid}",style="danger",emoji_id=EMOJI["❌"]),
                  ib("✅ Unblock",f"a_unblocku_{uid}",style="success",emoji_id=EMOJI["✅"])],
                 [ib("🗑 Delete",f"a_deleteu_{uid}",style="danger",emoji_id=EMOJI["❌"])],
-                [ib("🔙 Back","a_members",style="primary",emoji_id=EMOJI["📌"])]
+                [back_button("a_members")]
             ]),parse_mode=ParseMode.HTML)
         return ConversationHandler.END
     if d.startswith("a_blocku_"):
@@ -1040,13 +1049,13 @@ async def admin_cb(update,ctx):
         return ConversationHandler.END
     if d.startswith("a_msgu_"):
         ctx.user_data["msg_uid"]=int(d.split("_")[-1])
-        await q.edit_message_text("💬 Send the message to deliver to this user.")
+        await q.edit_message_text("💬 Send the message to deliver to this user.",reply_markup=back_kb("a_members"))
         return S_USERMSG
 
     if d in ("a_back","a_dash"):await q.edit_message_text(dash(),reply_markup=admin_kb(),parse_mode=ParseMode.HTML);return ConversationHandler.END
     if d=="a_close":await q.edit_message_text("❌ Admin panel closed.");return ConversationHandler.END
     if d=="a_chs":await show_channels(q);return ConversationHandler.END
-    if d=="a_addch":await q.edit_message_text("📢 <b>Add Channel</b>\n\nSend Channel ID.",parse_mode=ParseMode.HTML);return S_CH_ID
+    if d=="a_addch":await q.edit_message_text("📢 <b>Add Channel</b>\n\nSend Channel ID.",reply_markup=back_kb("a_chs"),parse_mode=ParseMode.HTML);return S_CH_ID
     if d.startswith("a_delc_"):
         cid=int(d.split("_")[-1]);ctx.user_data["confirm"]=("delc",cid)
         await q.edit_message_text("⚠️ <b>Are you sure?</b>\n\nDelete this channel?",reply_markup=InlineKeyboardMarkup([[ib("✅ Confirm",f"a_confirm_{cid}",style="danger",emoji_id=EMOJI["❌"]),ib("❌ Cancel","a_chs",style="primary",emoji_id=EMOJI["📌"])] ]),parse_mode=ParseMode.HTML);return ConversationHandler.END
@@ -1061,12 +1070,12 @@ async def admin_cb(update,ctx):
         r=channel(int(d.split("_")[-1]));ok,adm,title,status=await channel_status(ctx.bot,r[1])
         await q.edit_message_text(f"🧪 <b>Channel Status</b>\n\nName: <b>{esc(r[2])}</b>\nAccessible: {'✅ YES' if ok else '❌ NO'}\nBot Admin: {'✅ YES' if adm else '❌ NO'}\nStatus: <code>{esc(status)}</code>",reply_markup=back_kb("a_chs"),parse_mode=ParseMode.HTML);return ConversationHandler.END
     if d.startswith("a_editc_"):
-        ctx.user_data["edit_channel"]=int(d.split("_")[-1]);await q.edit_message_text("✏️ Send new channel name:");return S_EDITNAME
+        ctx.user_data["edit_channel"]=int(d.split("_")[-1]);await q.edit_message_text("✏️ Send new channel name:",reply_markup=back_kb("a_chs"));return S_EDITNAME
     if d=="a_msgs":await q.edit_message_text("📝 <b>MESSAGE MANAGEMENT</b>\n\nHTML formatting is preserved.",reply_markup=msg_kb(),parse_mode=ParseMode.HTML);return ConversationHandler.END
     mm={"a_top":("top","Top Message",S_TOP),"a_welcome":("welcome","Welcome Message",S_WELCOME),"a_postjoin":("postjoin","Post-Join Message",S_POSTJOIN),"a_btn1":("btn1_msg",_legacy_names("btn1"),S_BTN1),"a_btn2":("btn2_msg",_legacy_names("btn2"),S_BTN2),"a_btn3":("btn3_msg",_legacy_names("btn3"),S_BTN3)}
     if d in mm:
-        k,n,s=mm[d];await q.edit_message_text(f"✏️ <b>{esc(n)}</b>\n\nCurrent:\n<pre>{esc(gset(k)[:1500])}</pre>\n\nSend new text.",parse_mode=ParseMode.HTML);return s
-    if d=="a_welcome_photo":await q.edit_message_text("🖼 <b>Welcome Photo</b>\n\nSend a photo or <code>clear</code>.",parse_mode=ParseMode.HTML);return S_WELCOME_PHOTO
+        k,n,s=mm[d];await q.edit_message_text(f"✏️ <b>{esc(n)}</b>\n\nCurrent:\n<pre>{esc(gset(k)[:1500])}</pre>\n\nSend new text.",reply_markup=back_kb("a_msgs"),parse_mode=ParseMode.HTML);return s
+    if d=="a_welcome_photo":await q.edit_message_text("🖼 <b>Welcome Photo</b>\n\nSend a photo or <code>clear</code>.",reply_markup=back_kb("a_msgs"),parse_mode=ParseMode.HTML);return S_WELCOME_PHOTO
     if d=="a_buttons":
         await q.edit_message_text("🎨 <b>BUTTON MANAGEMENT</b>\n\nChoose public buttons or Admin Panel buttons.\nGlobal premium mode can be toggled here.",reply_markup=btn_kb(),parse_mode=ParseMode.HTML);return ConversationHandler.END
     if d in ("a_public_buttons","a_admin_buttons"):
@@ -1078,7 +1087,7 @@ async def admin_cb(update,ctx):
         keys=[k for k in BUTTON_DEFAULTS if k.startswith("ui_")== (prefix=="admin") and not get_button_config(k).get("enabled")]
         rows=[]
         for key in keys: rows.append([ib("🔴 "+get_button_config(key)["label"][:24],"a_editbutton_"+key,style=get_button_config(key)["style"])])
-        rows.append([ib("🔙 Back","a_public_buttons" if prefix=="public" else "a_admin_buttons",style="primary",emoji_id=EMOJI["📌"])])
+        rows.append([back_button("a_public_buttons" if prefix=="public" else "a_admin_buttons")])
         await q.edit_message_text("🎨 <b>DISABLED BUTTONS</b>\n\nSelect a button to edit or re-enable it.",reply_markup=InlineKeyboardMarkup(rows),parse_mode=ParseMode.HTML);return ConversationHandler.END
     if d.startswith("a_editbutton_"):
         key=d[len("a_editbutton_"):]
@@ -1093,15 +1102,15 @@ async def admin_cb(update,ctx):
     if d.startswith("a_btnname_"):
         key=d[len("a_btnname_"):]
         if key not in BUTTON_DEFAULTS:return ConversationHandler.END
-        ctx.user_data["button_edit_key"]=key;await q.edit_message_text("✏️ <b>Edit Button Name</b>\n\nSend the new button name:\n\nCurrent: <code>"+esc(get_button_config(key)["label"])+"</code>",parse_mode=ParseMode.HTML);return S_BTN_NAME
+        ctx.user_data["button_edit_key"]=key;await q.edit_message_text("✏️ <b>Edit Button Name</b>\n\nSend the new button name:\n\nCurrent: <code>"+esc(get_button_config(key)["label"])+"</code>",reply_markup=back_kb(f"a_editbutton_{key}"),parse_mode=ParseMode.HTML);return S_BTN_NAME
     if d.startswith("a_btnnormal_"):
         key=d[len("a_btnnormal_"):]
         if key not in BUTTON_DEFAULTS:return ConversationHandler.END
-        ctx.user_data["button_edit_key"]=key;await q.edit_message_text("🧩 <b>Set Normal Emoji</b>\n\nSend a normal Unicode emoji such as 🎯 📊 🤝 🔥 ⭐ 💎 🚀.\nSend <code>clear</code> to remove it.\n\nCurrent: <code>"+esc(get_button_config(key).get("normal_emoji") or "None")+"</code>",parse_mode=ParseMode.HTML);return S_BTN_NORMAL
+        ctx.user_data["button_edit_key"]=key;await q.edit_message_text("🧩 <b>Set Normal Emoji</b>\n\nSend a normal Unicode emoji such as 🎯 📊 🤝 🔥 ⭐ 💎 🚀.\nSend <code>clear</code> to remove it.\n\nCurrent: <code>"+esc(get_button_config(key).get("normal_emoji") or "None")+"</code>",reply_markup=back_kb(f"a_editbutton_{key}"),parse_mode=ParseMode.HTML);return S_BTN_NORMAL
     if d.startswith("a_btnpremium_"):
         key=d[len("a_btnpremium_"):]
         if key not in BUTTON_DEFAULTS:return ConversationHandler.END
-        ctx.user_data["button_edit_key"]=key;await q.edit_message_text("👑 <b>Set Premium Custom Emoji</b>\n\nSend numeric Telegram custom emoji ID.\nExample: <code>5228855127892327218</code>\nSend <code>clear</code> to remove the premium emoji.\n\nCurrent: <code>"+esc(get_button_config(key).get("premium_emoji_id") or "None")+"</code>",parse_mode=ParseMode.HTML);return S_BTN_PREMIUM
+        ctx.user_data["button_edit_key"]=key;await q.edit_message_text("👑 <b>Set Premium Custom Emoji</b>\n\nSend the premium/custom emoji itself (easy mode) and I will automatically detect its Telegram Custom Emoji ID.\n\nYou can also send a numeric Telegram custom emoji ID.\nExample: <code>5228855127892327218</code>\nSend <code>clear</code> to remove the premium emoji.\n\nCurrent: <code>"+esc(get_button_config(key).get("premium_emoji_id") or "None")+"</code>",reply_markup=back_kb(f"a_editbutton_{key}"),parse_mode=ParseMode.HTML);return S_BTN_PREMIUM
     if d.startswith("a_btntoggle_"):
         key=d[len("a_btntoggle_"):];cfg=get_button_config(key)
         save_button_config(key,premium_enabled=not cfg.get("premium_enabled"));await q.edit_message_text("✅ Premium emoji setting updated.",reply_markup=button_editor_kb(key),parse_mode=ParseMode.HTML);return ConversationHandler.END
@@ -1151,8 +1160,8 @@ async def admin_cb(update,ctx):
         if not ok:await q.answer("Custom emoji unavailable; fallback sent.",show_alert=True)
         return ConversationHandler.END
     if d=="a_members":
-        await q.edit_message_text(f"👥 <b>MEMBERS</b>\n\nTotal Users: <b>{scalar('SELECT COUNT(*) FROM users')}</b>",reply_markup=InlineKeyboardMarkup([[ib("🔎 Search User","a_search",style="primary",emoji_id=EMOJI["📊"])],[ib("📤 Export Users","a_export",style="success",emoji_id=EMOJI["📌"])],[ib("🔙 Back","a_back",style="primary",emoji_id=EMOJI["📌"])] ]),parse_mode=ParseMode.HTML);return ConversationHandler.END
-    if d=="a_search":await q.edit_message_text("🔎 Send User ID, username, or name:");return S_SEARCH
+        await q.edit_message_text(f"👥 <b>MEMBERS</b>\n\nTotal Users: <b>{scalar('SELECT COUNT(*) FROM users')}</b>",reply_markup=InlineKeyboardMarkup([[ib("🔎 Search User","a_search",style="primary",emoji_id=EMOJI["📊"])],[ib("📤 Export Users","a_export",style="success",emoji_id=EMOJI["📌"])],[back_button("a_back")] ]),parse_mode=ParseMode.HTML);return ConversationHandler.END
+    if d=="a_search":await q.edit_message_text("🔎 Send User ID, username, or name:",reply_markup=back_kb("a_members"));return S_SEARCH
     if d=="a_export":
         p=Path(tempfile.gettempdir())/f"users_{int(time.time())}.csv"
         with db() as c:
@@ -1163,8 +1172,8 @@ async def admin_cb(update,ctx):
         finally:p.unlink(missing_ok=True)
         return ConversationHandler.END
     if d=="a_bcast":
-        rows=scalar("SELECT COUNT(*) FROM broadcasts");await q.edit_message_text(f"📣 <b>BROADCAST CENTER</b>\n\nHistory records: <b>{rows}</b>",reply_markup=InlineKeyboardMarkup([[ib("📣 New Broadcast","a_newbcast",style="success",emoji_id=EMOJI["📣"])],[ib("🔙 Back","a_back",style="primary",emoji_id=EMOJI["📌"])] ]),parse_mode=ParseMode.HTML);return ConversationHandler.END
-    if d=="a_newbcast":await q.edit_message_text("📣 <b>Send Text, Photo+Caption, or Video+Caption.</b>",parse_mode=ParseMode.HTML);return S_BCAST
+        rows=scalar("SELECT COUNT(*) FROM broadcasts");await q.edit_message_text(f"📣 <b>BROADCAST CENTER</b>\n\nHistory records: <b>{rows}</b>",reply_markup=InlineKeyboardMarkup([[ib("📣 New Broadcast","a_newbcast",style="success",emoji_id=EMOJI["📣"])],[back_button("a_back")] ]),parse_mode=ParseMode.HTML);return ConversationHandler.END
+    if d=="a_newbcast":await q.edit_message_text("📣 <b>Send Text, Photo+Caption, or Video+Caption.</b>",reply_markup=back_kb("a_bcast"),parse_mode=ParseMode.HTML);return S_BCAST
     if d.startswith("a_cancelbc_"):await cancel_bcast(q,d[len("a_cancelbc_"):]);await q.edit_message_text("⏹ Broadcast cancelled.",reply_markup=back_kb("a_bcast"));return ConversationHandler.END
     if d.startswith("a_delbc_"):
         bid=d[len("a_delbc_"):];removed=0
@@ -1197,7 +1206,7 @@ async def admin_cb(update,ctx):
         return ConversationHandler.END
     if d=="a_backup_menu":
         names="\n".join("• <code>"+esc(p.name)+"</code>" for p in backup_list()[:10]) or "No backups."
-        await q.edit_message_text("💾 <b>BACKUP CENTER</b>\n\n"+names,reply_markup=InlineKeyboardMarkup([[ib("💾 Create Backup","a_backup",style="success",emoji_id=EMOJI["⚙️"])],[ib("📤 Download Latest","a_download",style="primary",emoji_id=EMOJI["📌"])],[ib("🗑 Delete Old Backups","a_cleanup",style="danger",emoji_id=EMOJI["❌"])],[ib("🔙 Back","a_back",style="primary",emoji_id=EMOJI["📌"])] ]),parse_mode=ParseMode.HTML);return ConversationHandler.END
+        await q.edit_message_text("💾 <b>BACKUP CENTER</b>\n\n"+names,reply_markup=InlineKeyboardMarkup([[ib("💾 Create Backup","a_backup",style="success",emoji_id=EMOJI["⚙️"])],[ib("📤 Download Latest","a_download",style="primary",emoji_id=EMOJI["📌"])],[ib("🗑 Delete Old Backups","a_cleanup",style="danger",emoji_id=EMOJI["❌"])],[back_button("a_back")] ]),parse_mode=ParseMode.HTML);return ConversationHandler.END
     if d=="a_backup":
         try:
             await q.answer("💾 Creating backup…")
@@ -1238,7 +1247,7 @@ async def admin_cb(update,ctx):
             "♻️ <b>Safe Restore</b>\n\nSend the backup <code>.zip</code> file.\n"
             "ZIP, path traversal, database integrity and required tables are validated.\n"
             "A safety backup is created first.\n\nAfter restore: <b>Restart bot to apply restored state.</b>",
-            parse_mode=ParseMode.HTML)
+            reply_markup=back_kb("a_backup_menu"), parse_mode=ParseMode.HTML)
         return S_RESTORE
     if d=="a_dbhealth":await q.edit_message_text(dbhealth(),reply_markup=back_kb(),parse_mode=ParseMode.HTML);return ConversationHandler.END
     if d=="a_health":await q.edit_message_text(health(),reply_markup=back_kb(),parse_mode=ParseMode.HTML);return ConversationHandler.END
@@ -1249,7 +1258,7 @@ async def admin_cb(update,ctx):
     if d=="a_errors":
         with db() as c:rows=c.execute("SELECT created_at,level,message FROM error_logs ORDER BY id DESC LIMIT 20").fetchall()
         text="📜 <b>RECENT ERRORS</b>\n\n"+"\n".join(f"<code>{esc(r[0])}</code> · <b>{esc(r[1])}</b> · {esc(r[2])}" for r in rows) if rows else "📜 <b>RECENT ERRORS</b>\n\nNo errors."
-        await q.edit_message_text(text,reply_markup=InlineKeyboardMarkup([[ib("🧹 Clear Logs","a_clearlogs_confirm",style="danger",emoji_id=EMOJI["❌"])],[ib("🔙 Back","a_back",style="primary",emoji_id=EMOJI["📌"])] ]),parse_mode=ParseMode.HTML);return ConversationHandler.END
+        await q.edit_message_text(text,reply_markup=InlineKeyboardMarkup([[ib("🧹 Clear Logs","a_clearlogs_confirm",style="danger",emoji_id=EMOJI["❌"])],[back_button("a_back")] ]),parse_mode=ParseMode.HTML);return ConversationHandler.END
     if d=="a_clearlogs_confirm":await q.edit_message_text("⚠️ <b>Are you sure?</b>",reply_markup=InlineKeyboardMarkup([[ib("✅ Confirm","a_clearlogs",style="danger",emoji_id=EMOJI["❌"]),ib("❌ Cancel","a_errors",style="primary",emoji_id=EMOJI["📌"])] ]),parse_mode=ParseMode.HTML);return ConversationHandler.END
     if d=="a_clearlogs":
         with db() as c:c.execute("DELETE FROM error_logs")
@@ -1264,7 +1273,7 @@ async def extra_cb(update,ctx):
         uid=int(d.split("_")[-1])
         with db() as c:r=c.execute("SELECT user_id,first_name,username,joined_at,status FROM users WHERE user_id=?",(uid,)).fetchone()
         if not r:return await q.answer("User not found.",show_alert=True)
-        await q.edit_message_text(f"👤 <b>USER</b>\n\nID: <code>{r[0]}</code>\nFirst Name: <b>{esc(r[1])}</b>\nUsername: <b>@{esc(r[2]) if r[2] else '—'}</b>\nJoin Date: <code>{esc(r[3])}</code>\nStatus: <b>{esc(r[4])}</b>",reply_markup=InlineKeyboardMarkup([[ib("💬 Send Message",f"a_msgu_{uid}",style="primary",emoji_id=EMOJI["💬"])],[ib("🚫 Block",f"a_blocku_{uid}",style="danger",emoji_id=EMOJI["❌"]),ib("✅ Unblock",f"a_unblocku_{uid}",style="success",emoji_id=EMOJI["✅"])],[ib("🗑 Delete",f"a_deleteu_{uid}",style="danger",emoji_id=EMOJI["❌"])],[ib("🔙 Back","a_members",style="primary",emoji_id=EMOJI["📌"])] ]),parse_mode=ParseMode.HTML)
+        await q.edit_message_text(f"👤 <b>USER</b>\n\nID: <code>{r[0]}</code>\nFirst Name: <b>{esc(r[1])}</b>\nUsername: <b>@{esc(r[2]) if r[2] else '—'}</b>\nJoin Date: <code>{esc(r[3])}</code>\nStatus: <b>{esc(r[4])}</b>",reply_markup=InlineKeyboardMarkup([[ib("💬 Send Message",f"a_msgu_{uid}",style="primary",emoji_id=EMOJI["💬"])],[ib("🚫 Block",f"a_blocku_{uid}",style="danger",emoji_id=EMOJI["❌"]),ib("✅ Unblock",f"a_unblocku_{uid}",style="success",emoji_id=EMOJI["✅"])],[ib("🗑 Delete",f"a_deleteu_{uid}",style="danger",emoji_id=EMOJI["❌"])],[back_button("a_members")] ]),parse_mode=ParseMode.HTML)
     elif d.startswith("a_blocku_"):
         uid=int(d.split("_")[-1]);await q.edit_message_text("⚠️ <b>Are you sure?</b>\n\nBlock this user?",reply_markup=InlineKeyboardMarkup([[ib("✅ Confirm",f"a_confirmblock_{uid}",style="danger",emoji_id=EMOJI["❌"]),ib("❌ Cancel",f"a_viewu_{uid}",style="primary",emoji_id=EMOJI["📌"])] ]),parse_mode=ParseMode.HTML)
     elif d.startswith("a_confirmblock_"):set_status(int(d.split("_")[-1]),"blocked");await q.edit_message_text("🚫 User blocked.",reply_markup=back_kb("a_members"))
@@ -1394,7 +1403,7 @@ def main():
         S_POSTJOIN:[MessageHandler(tf,s_postjoin)],S_TOP:[MessageHandler(tf,s_top)],S_BTN1:[MessageHandler(tf,s_btn1)],S_BTN2:[MessageHandler(tf,s_btn2)],S_BTN3:[MessageHandler(tf,s_btn3)],
         S_BCAST:[MessageHandler(bf,start_bcast)],S_RESTORE:[MessageHandler(rf,s_restore)],S_SEARCH:[MessageHandler(tf,s_search)],S_USERMSG:[MessageHandler(bf,s_usermsg)],
         S_EDITNAME:[MessageHandler(tf,s_editname)],S_EDITLINK:[MessageHandler(tf,s_editlink)],S_EMOJI:[MessageHandler(tf,s_emoji)],S_BTN_NAME:[MessageHandler(tf,s_button_name)],S_BTN_NORMAL:[MessageHandler(tf,s_button_normal)],S_BTN_PREMIUM:[MessageHandler(tf,s_button_premium)]
-      },fallbacks=[CommandHandler("cancel",cancel)],per_chat=False,per_user=True,allow_reentry=True)
+      },fallbacks=[CommandHandler("cancel",cancel),CallbackQueryHandler(admin_cb,pattern=r"^a_")],per_chat=False,per_user=True,allow_reentry=True)
     app.add_handler(CommandHandler("start",start));app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(cb_check,pattern=r"^check_joined$"));app.add_handler(CallbackQueryHandler(cb_btn,pattern=r"^btn[123]$"));app.add_handler(CallbackQueryHandler(cb_back,pattern=r"^back_main$"))
     app.add_handler(ChatJoinRequestHandler(join_request));app.add_error_handler(errors)
