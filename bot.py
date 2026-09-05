@@ -35,6 +35,7 @@ HTTP_SERVER = None
 HTTP_SERVER_THREAD = None
 INSTANCE_LOCK_FILE = None
 INSTANCE_LOCK_FH = None
+CONFLICT_SHUTDOWN = False
 
 BTN1, BTN2, BTN3 = "🎯 Claim Agent", "📊 Statistics", "🤝 Refer & Earn"
 EMOJI = {"🎯": "5228855127892327218", "📊": "6093382540784046658", "🤝": "6086990448331592466", "📣": "6095891759462617671", "💬": "6095865895169560113", "📝": "6010292709066019210", "🖼️": "5341285075210224047", "➕": "6093406373557571574", "❌": "6010471186432005118", "⚙️": "6010355840790303830", "✅": "6246537187614005254", "🌟": "5783170625090622777", "📌": "6089019283508040459", "🔔": "6093852083788715042", "👑": "6247039939305808563", "💰": "5785325680765965100"}
@@ -1529,14 +1530,43 @@ async def post_shutdown(app):
 
 async def cancel(u,c):c.user_data.clear();await u.message.reply_text("❌ Cancelled.");return ConversationHandler.END
 async def errors(update,ctx):
-    if ctx.error:
-        logger.exception("Unhandled exception",exc_info=ctx.error)
-        # Never erase or globally disable saved premium configuration because one
-        # button can contain an invalid/unsupported ID. The next explicit render
-        # will still consult SQLite, preserving admin configuration.
-        msg=str(ctx.error).lower()
-        if "icon_custom_emoji_id" in msg or "custom emoji" in msg or "not enough rights" in msg:
-            log_error("ERROR","Premium custom emoji request rejected; saved configuration preserved: "+str(ctx.error))
+    global CONFLICT_SHUTDOWN
+    err=ctx.error
+    if not err:
+        return
+
+    # PTB forwards polling errors to the application error handlers with
+    # update=None. A Telegram 409 means another process is polling this bot
+    # token. Do not keep retrying forever: request a graceful application
+    # shutdown from inside the error callback.
+    if isinstance(err, telegram.error.Conflict):
+        if not CONFLICT_SHUTDOWN:
+            CONFLICT_SHUTDOWN=True
+            logger.critical(
+                "Telegram polling stopped: 409 Conflict detected. "
+                "Another process/service is using the same BOT_TOKEN with getUpdates. "
+                "This instance will shut down cleanly; stop the other polling instance "
+                "or use a newly generated token."
+            )
+            log_error(
+                "CRITICAL",
+                "Telegram polling stopped because another getUpdates instance is using the same BOT_TOKEN."
+            )
+        # PTB documents stop_running() specifically for handlers/error callbacks
+        # used with run_polling/run_webhook and it preserves the normal shutdown path.
+        try:
+            ctx.application.stop_running()
+        except Exception:
+            logger.exception("Failed to request graceful shutdown after Telegram 409 Conflict")
+        return
+
+    logger.exception("Unhandled exception",exc_info=err)
+    # Never erase or globally disable saved premium configuration because one
+    # button can contain an invalid/unsupported ID. The next explicit render
+    # will still consult SQLite, preserving admin configuration.
+    msg=str(err).lower()
+    if "icon_custom_emoji_id" in msg or "custom emoji" in msg or "not enough rights" in msg:
+        log_error("ERROR","Premium custom emoji request rejected; saved configuration preserved: "+str(err))
 
 class RenderHealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -1567,24 +1597,32 @@ def stop_render_health_server():
         HTTP_SERVER=None
 
 def acquire_instance_lock():
-    """Prevent accidental duplicate bot processes on the same Render instance."""
+    """Prevent duplicate bot processes inside the same OS/container.
+
+    NOTE: This cannot prevent a different Render service, VPS, local machine,
+    or other host from polling with the same Telegram BOT_TOKEN. Telegram's
+    server-side 409 handler below deals with that external case.
+    """
     global INSTANCE_LOCK_FILE, INSTANCE_LOCK_FH
     lock_path = os.getenv("BOT_INSTANCE_LOCK", ".bot-instance.lock")
     INSTANCE_LOCK_FILE = lock_path
     try:
-        fh = open(lock_path, "a+")
+        fh = open(lock_path, "a+", encoding="utf-8")
         if fcntl is None:
             INSTANCE_LOCK_FH = fh
-            logger.warning("Instance lock opened, but OS file locking is unavailable on this platform.")
+            logger.warning("Local instance lock unavailable on this platform; continuing with Telegram-side conflict protection.")
             return True
         try:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            logger.critical("Another bot process is already running in this service. Refusing to start a second polling process.")
+            logger.critical("Duplicate bot process detected in this service. Refusing to start a second polling process.")
             fh.close()
             return False
+        fh.seek(0)
+        fh.truncate()
         fh.write(str(os.getpid()))
         fh.flush()
+        os.fsync(fh.fileno())
         INSTANCE_LOCK_FH = fh
         return True
     except Exception as e:
@@ -1630,16 +1668,19 @@ def main():
     start_render_health_server()
     logger.info("Bot started: v%s / PTB %s / ADMIN_ID=%s / OWNER_ID=%s",BOT_VERSION,telegram.__version__,ADMIN_ID,OWNER_ID)
     try:
-        try:
-            app.run_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=True)
-        except telegram.error.Conflict:
-            logger.critical(
-                "Telegram 409 Conflict: another getUpdates polling process is using this BOT_TOKEN. "
-                "Stop every other deployment/local bot using this token and keep exactly ONE Render instance/process."
-            )
-            raise
+        # Exactly one polling owner for this process. Telegram 409 conflicts are
+        # handled by the registered error handler via Application.stop_running(),
+        # which lets PTB complete its documented graceful shutdown sequence.
+        app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
     finally:
         stop_render_health_server()
         release_instance_lock()
+    if CONFLICT_SHUTDOWN:
+        # A detected 409 is a real deployment/runtime conflict, so make Render
+        # restart the service instead of leaving a conflicted process alive.
+        raise SystemExit(1)
 
 if __name__=="__main__":main()
