@@ -19,7 +19,7 @@ try: OWNER_ID = int(os.getenv("OWNER_ID", str(ADMIN_ID)).strip())
 except ValueError: OWNER_ID = ADMIN_ID
 DB_PATH = os.getenv("DB_PATH", "bot2.db").strip() or "bot2.db"
 BACKUP_DIR = Path(os.getenv("BACKUP_DIR", "backups")); BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-BOT_VERSION, DB_VERSION = "4.0.0", 4
+BOT_VERSION, DB_VERSION = "4.1.0", 5
 STARTED_AT = time.monotonic()
 LAST_ERROR = ""
 ERROR_LOG_MAX = 200
@@ -38,7 +38,7 @@ logger = logging.getLogger("force_join_bot")
 
 # Conversation states
 (S_CH_ID,S_CH_NAME,S_CH_LINK,S_WELCOME,S_WELCOME_PHOTO,S_POSTJOIN,S_TOP,S_BTN1,S_BTN2,S_BTN3,
- S_BCAST,S_RESTORE,S_SEARCH,S_USERMSG,S_EDITNAME,S_EDITLINK,S_EMOJI)=range(17)
+ S_BCAST,S_RESTORE,S_SEARCH,S_USERMSG,S_EDITNAME,S_EDITLINK,S_EMOJI,S_BTN_NAME,S_BTN_NORMAL,S_BTN_PREMIUM)=range(20)
 
 @contextmanager
 def db():
@@ -115,8 +115,10 @@ def init_db():
           "button_style_btn1":"primary","button_style_btn2":"success","button_style_btn3":"primary",
           "button_emoji_btn1":EMOJI["🎯"],"button_emoji_btn2":EMOJI["📊"],"button_emoji_btn3":EMOJI["🤝"],
           "button_emoji_enabled_btn1":"1","button_emoji_enabled_btn2":"1","button_emoji_enabled_btn3":"1",
+          "premium_emoji_system_enabled":"1",
         }
         for k,v in defaults.items(): c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(k,str(v)))
+        migrate_button_configs(c)
 
 def control_ids():
     ids=set()
@@ -208,21 +210,220 @@ async def channel_status(bot,cid):
         return True,m.status in ("administrator","creator"),ch.title or str(cid),m.status
     except TelegramError as e:return False,False,str(e),"error"
 
-def ib(text,callback_data=None,url=None,style=None,emoji_id=None):
-    kw={"text":text}
-    if not PREMIUM_EMOJI_ENABLED: emoji_id=None
-    if callback_data is not None:kw["callback_data"]=callback_data
-    if url is not None:kw["url"]=url
-    if style in ("primary","success","danger"):kw["style"]=style
-    if emoji_id:kw["icon_custom_emoji_id"]=str(emoji_id)
-    try:return InlineKeyboardButton(**kw)
+# ---------------------------------------------------------------------------
+# Centralized button configuration / rendering
+# ---------------------------------------------------------------------------
+BUTTON_DEFAULTS = {
+    "btn1": {"label":"Claim Agent", "normal_emoji":"🎯", "premium_emoji_id":EMOJI["🎯"], "premium_enabled":True, "style":"primary", "callback_data":"btn1", "url":None, "position":1, "enabled":True},
+    "btn2": {"label":"Statistics", "normal_emoji":"📊", "premium_emoji_id":EMOJI["📊"], "premium_enabled":True, "style":"success", "callback_data":"btn2", "url":None, "position":2, "enabled":True},
+    "btn3": {"label":"Refer & Earn", "normal_emoji":"🤝", "premium_emoji_id":EMOJI["🤝"], "premium_enabled":True, "style":"primary", "callback_data":"btn3", "url":None, "position":3, "enabled":True},
+    "ui_a_dash": {"label":"Dashboard", "normal_emoji":"📊", "premium_emoji_id":EMOJI["📊"], "premium_enabled":True, "style":"primary", "callback_data":"a_dash", "url":None, "position":1, "enabled":True},
+    "ui_a_chs": {"label":"Channels", "normal_emoji":"📢", "premium_emoji_id":EMOJI["📣"], "premium_enabled":True, "style":"primary", "callback_data":"a_chs", "url":None, "position":2, "enabled":True},
+    "ui_a_msgs": {"label":"Messages", "normal_emoji":"📝", "premium_emoji_id":EMOJI["📝"], "premium_enabled":True, "style":"primary", "callback_data":"a_msgs", "url":None, "position":3, "enabled":True},
+    "ui_a_buttons": {"label":"Buttons", "normal_emoji":"🎨", "premium_emoji_id":EMOJI["🌟"], "premium_enabled":True, "style":"success", "callback_data":"a_buttons", "url":None, "position":4, "enabled":True},
+    "ui_a_bcast": {"label":"Broadcast", "normal_emoji":"📣", "premium_emoji_id":EMOJI["📣"], "premium_enabled":True, "style":"success", "callback_data":"a_bcast", "url":None, "position":5, "enabled":True},
+    "ui_a_members": {"label":"Members", "normal_emoji":"👥", "premium_emoji_id":EMOJI["👑"], "premium_enabled":True, "style":"primary", "callback_data":"a_members", "url":None, "position":6, "enabled":True},
+    "ui_a_backup_menu": {"label":"Backup Center", "normal_emoji":"💾", "premium_emoji_id":EMOJI["⚙️"], "premium_enabled":True, "style":"primary", "callback_data":"a_backup_menu", "url":None, "position":7, "enabled":True},
+    "ui_a_restore": {"label":"Restore", "normal_emoji":"♻️", "premium_emoji_id":EMOJI["✅"], "premium_enabled":True, "style":"danger", "callback_data":"a_restore", "url":None, "position":8, "enabled":True},
+    "ui_a_dbhealth": {"label":"Database Health", "normal_emoji":"🩺", "premium_emoji_id":EMOJI["📊"], "premium_enabled":True, "style":"primary", "callback_data":"a_dbhealth", "url":None, "position":9, "enabled":True},
+    "ui_a_health": {"label":"Bot Health", "normal_emoji":"❤️", "premium_emoji_id":EMOJI["🌟"], "premium_enabled":True, "style":"success", "callback_data":"a_health", "url":None, "position":10, "enabled":True},
+    "ui_a_settings": {"label":"Settings", "normal_emoji":"⚙️", "premium_emoji_id":EMOJI["⚙️"], "premium_enabled":True, "style":"primary", "callback_data":"a_settings", "url":None, "position":11, "enabled":True},
+    "ui_a_premium_test": {"label":"Premium Button Test", "normal_emoji":"🧪", "premium_emoji_id":EMOJI["🌟"], "premium_enabled":True, "style":"success", "callback_data":"a_premium_test", "url":None, "position":12, "enabled":True},
+    "ui_a_errors": {"label":"Error Log", "normal_emoji":"📜", "premium_emoji_id":EMOJI["📝"], "premium_enabled":True, "style":"primary", "callback_data":"a_errors", "url":None, "position":13, "enabled":True},
+    "ui_a_close": {"label":"Close", "normal_emoji":"❌", "premium_emoji_id":EMOJI["❌"], "premium_enabled":True, "style":"danger", "callback_data":"a_close", "url":None, "position":14, "enabled":True},
+}
+BUTTON_STYLES = ("primary", "success", "danger")
+BUTTON_CONFIG_PREFIX = "button_cfg_"
+
+
+def _default_config(key):
+    d=BUTTON_DEFAULTS.get(key)
+    return dict(d) if d else None
+
+
+def _strip_known_leading_emoji(text):
+    v=str(text or "").strip()
+    for emoji in sorted(EMOJI.keys(), key=len, reverse=True):
+        if v.startswith(emoji):
+            return v[len(emoji):].lstrip()
+    return v
+
+
+def _config_to_json(cfg):
+    import json
+    return json.dumps(cfg,ensure_ascii=False,separators=(",",":"))
+
+
+def _config_from_json(raw):
+    import json
+    try:
+        v=json.loads(raw)
+        return v if isinstance(v,dict) else None
+    except Exception:
+        return None
+
+
+def migrate_button_configs(conn=None):
+    """Create idempotent v5 button config records and migrate legacy settings."""
+    own=conn is None
+    if own:
+        conn=sqlite3.connect(DB_PATH,timeout=30,check_same_thread=False)
+    try:
+        for key,default in BUTTON_DEFAULTS.items():
+            raw=conn.execute("SELECT value FROM settings WHERE key=?",(BUTTON_CONFIG_PREFIX+key,)).fetchone()
+            if raw:
+                continue
+            cfg=dict(default)
+            if key in ("btn1","btn2","btn3"):
+                idx=key[-1]
+                legacy_label={"btn1":BTN1,"btn2":BTN2,"btn3":BTN3}[key]
+                cfg["label"]=_strip_known_leading_emoji(legacy_label)
+                cfg["style"]=conn.execute("SELECT value FROM settings WHERE key=?",("button_style_"+key,)).fetchone()
+                cfg["style"]=cfg["style"][0] if cfg["style"] else default["style"]
+                eid=conn.execute("SELECT value FROM settings WHERE key=?",("button_emoji_"+key,)).fetchone()
+                enabled=conn.execute("SELECT value FROM settings WHERE key=?",("button_emoji_enabled_"+key,)).fetchone()
+                cfg["premium_emoji_id"]=eid[0] if eid and str(eid[0]).isdigit() else default["premium_emoji_id"]
+                cfg["premium_enabled"]=(enabled[0] == "1") if enabled else default["premium_enabled"]
+            if cfg.get("style") not in BUTTON_STYLES: cfg["style"]=default["style"]
+            conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(BUTTON_CONFIG_PREFIX+key,_config_to_json(cfg)))
+        if own: conn.commit()
+    finally:
+        if own: conn.close()
+
+
+def get_button_config(key):
+    default=_default_config(key)
+    if not default: return None
+    raw=gset(BUTTON_CONFIG_PREFIX+key,"")
+    cfg=_config_from_json(raw) if raw else None
+    if not cfg:
+        migrate_button_configs(); raw=gset(BUTTON_CONFIG_PREFIX+key,""); cfg=_config_from_json(raw) if raw else None
+    cfg=cfg or dict(default)
+    merged=dict(default);merged.update(cfg)
+    merged["label"]=_strip_known_leading_emoji(merged.get("label",default["label"])) or default["label"]
+    merged["normal_emoji"]=str(merged.get("normal_emoji",default["normal_emoji"]) or "")
+    pe=str(merged.get("premium_emoji_id","") or "")
+    merged["premium_emoji_id"]=pe if pe.isdigit() else ""
+    merged["premium_enabled"]=bool(merged.get("premium_enabled",default["premium_enabled"]))
+    merged["style"]=merged.get("style") if merged.get("style") in BUTTON_STYLES else default["style"]
+    merged["position"]=int(merged.get("position",default["position"]) or default["position"])
+    merged["enabled"]=bool(merged.get("enabled",default["enabled"]))
+    merged["callback_data"]=default["callback_data"]
+    merged["url"]=default.get("url")
+    return merged
+
+
+def save_button_config(key, **changes):
+    cfg=get_button_config(key)
+    if not cfg: raise KeyError(key)
+    for field,value in changes.items():
+        if field not in cfg or field in {"label","normal_emoji","premium_emoji_id","premium_enabled","style","position","enabled"}:
+            cfg[field]=value
+    cfg["label"]=_strip_known_leading_emoji(cfg.get("label","")).strip()
+    if not cfg["label"]: raise ValueError("Button name cannot be empty.")
+    if cfg.get("style") not in BUTTON_STYLES: raise ValueError("Invalid button style.")
+    cfg["premium_emoji_id"]="" if str(cfg.get("premium_emoji_id","")).strip().lower()=="clear" else str(cfg.get("premium_emoji_id","")).strip()
+    if cfg["premium_emoji_id"] and not cfg["premium_emoji_id"].isdigit(): raise ValueError("Premium Emoji ID must be numeric.")
+    cfg["normal_emoji"]=str(cfg.get("normal_emoji","") or "").strip()[:16]
+    cfg["position"]=max(1,int(cfg.get("position",1)))
+    cfg["enabled"]=bool(cfg.get("enabled",True))
+    with db() as c: c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",(BUTTON_CONFIG_PREFIX+key,_config_to_json(cfg)))
+    # Keep legacy public settings in sync for old integrations/backups/admin tools.
+    if key in ("btn1","btn2","btn3"):
+        with db() as c:
+            c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",("button_style_"+key,cfg["style"]))
+            c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",("button_emoji_"+key,cfg["premium_emoji_id"]))
+            c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",("button_emoji_enabled_"+key,"1" if cfg["premium_enabled"] and cfg["premium_emoji_id"] else "0"))
+    return cfg
+
+
+def reset_button_config(key):
+    cfg=_default_config(key)
+    if not cfg: raise KeyError(key)
+    return save_button_config(key,**cfg)
+
+
+def reset_all_button_configs():
+    for key in BUTTON_DEFAULTS: reset_button_config(key)
+
+
+def public_button_keys():
+    return [k for k in BUTTON_DEFAULTS if not k.startswith("ui_") and get_button_config(k).get("enabled")]
+
+
+def admin_button_keys():
+    return sorted((k for k in BUTTON_DEFAULTS if k.startswith("ui_") and get_button_config(k).get("enabled")),key=lambda k:get_button_config(k)["position"])
+
+
+def premium_system_enabled():
+    return gset("premium_emoji_system_enabled","1") == "1"
+
+
+def _build_button(text,callback_data=None,url=None,style=None,emoji_id=None):
+    # Low-level compatibility builder. It also removes a known duplicate leading
+    # Unicode icon when the same visual is supplied as Telegram's custom icon.
+    kw={"text":str(text or "")}
+    if callback_data is not None: kw["callback_data"]=str(callback_data)
+    if url is not None: kw["url"]=str(url)
+    if style in BUTTON_STYLES: kw["style"]=style
+    if emoji_id and premium_system_enabled():
+        eid=str(emoji_id)
+        reverse=next((em for em,known in EMOJI.items() if str(known)==eid),None)
+        if reverse and kw["text"].startswith(reverse): kw["text"]=_strip_known_leading_emoji(kw["text"])
+        kw["icon_custom_emoji_id"]=eid
+    try: return InlineKeyboardButton(**kw)
     except (TypeError,ValueError):
         kw.pop("style",None);kw.pop("icon_custom_emoji_id",None);return InlineKeyboardButton(**kw)
 
+
+def ib(text,callback_data=None,url=None,style=None,emoji_id=None):
+    return _build_button(text,callback_data=callback_data,url=url,style=style,emoji_id=emoji_id)
+
+
+def render_button(key,callback_data=None,url=None):
+    cfg=get_button_config(key)
+    if not cfg or not cfg.get("enabled"): return None
+    cb=cfg["callback_data"] if callback_data is None else callback_data
+    target_url=cfg.get("url") if url is None else url
+    use_premium=premium_system_enabled() and cfg.get("premium_enabled") and cfg.get("premium_emoji_id")
+    text=cfg["label"] if use_premium else ((cfg.get("normal_emoji","")+" "+cfg["label"]).strip())
+    return _build_button(text,callback_data=cb,url=target_url,style=cfg.get("style"),emoji_id=cfg.get("premium_emoji_id") if use_premium else None)
+
+
+def render_button_markup(key,callback_data=None,url=None):
+    b=render_button(key,callback_data=callback_data,url=url)
+    return InlineKeyboardMarkup([[b]]) if b else InlineKeyboardMarkup([])
+
+
 def bstyle(k):
-    x=gset("button_style_"+k,"primary");return x if x in ("primary","success","danger") else "primary"
+    cfg=get_button_config(k)
+    return cfg["style"] if cfg else "primary"
+
+
 def bemoji(k):
-    return gset("button_emoji_"+k,"") if gset("button_emoji_enabled_"+k,"1")=="1" else None
+    cfg=get_button_config(k)
+    return cfg.get("premium_emoji_id") if cfg and cfg.get("premium_enabled") and cfg.get("premium_emoji_id") else None
+
+
+def without_premium_markup(markup):
+    if not markup: return markup
+    rows=[]
+    for row in markup.inline_keyboard:
+        nr=[]
+        for btn in row:
+            text=str(btn.text or "")
+            eid=getattr(btn,"icon_custom_emoji_id",None)
+            if eid:
+                reverse=next((em for em,known in EMOJI.items() if str(known)==str(eid)),None)
+                if reverse and text.startswith(reverse): text=_strip_known_leading_emoji(text)
+                elif text and reverse is None: text="" + text
+            nr.append(_build_button(text,callback_data=btn.callback_data,url=btn.url,style=btn.style,emoji_id=None))
+        rows.append(nr)
+    return InlineKeyboardMarkup(rows)
+
+
+def _legacy_names(k):
+    cfg=get_button_config(k);return cfg["label"] if cfg else k
 
 def referral_count(uid):
     return scalar("SELECT COUNT(*) FROM referrals WHERE referrer_id=?",(uid,),0)
@@ -283,8 +484,16 @@ def process_referral(new_user_id, args):
         return False
 
 def main_kb():
-    return InlineKeyboardMarkup([[ib(BTN1,"btn1",style=bstyle("btn1"),emoji_id=bemoji("btn1")),ib(BTN2,"btn2",style=bstyle("btn2"),emoji_id=bemoji("btn2"))],[ib(BTN3,"btn3",style=bstyle("btn3"),emoji_id=bemoji("btn3"))]])
-def back_kb(cb="a_back"):return InlineKeyboardMarkup([[ib("🔙 Back",cb,style="primary",emoji_id=EMOJI["📌"])]])
+    keys=public_button_keys()
+    buttons=[render_button(k) for k in keys]
+    buttons=[b for b in buttons if b]
+    rows=[]
+    for i in range(0,len(buttons),2): rows.append(buttons[i:i+2])
+    return InlineKeyboardMarkup(rows)
+
+def back_kb(cb="a_back"):
+    return InlineKeyboardMarkup([[ib("🔙 Back",cb,style="primary",emoji_id=EMOJI["📌"])]] )
+
 def join_kb(rows,joined):
     a=[];b=[]
     for r in rows:
@@ -376,15 +585,13 @@ def dash():
             f"🧩 Version: <code>{BOT_VERSION}</code>\n╚═━━━━━━━━━━━━━━━━━━━━━━━━═╝")
 
 def admin_kb():
-    return InlineKeyboardMarkup([
-      [ib("📊 Dashboard","a_dash",style="primary",emoji_id=EMOJI["📊"]),ib("📢 Channels","a_chs",style="primary",emoji_id=EMOJI["📣"])],
-      [ib("📝 Messages","a_msgs",style="primary",emoji_id=EMOJI["📝"]),ib("🎨 Buttons","a_buttons",style="success",emoji_id=EMOJI["🌟"])],
-      [ib("📣 Broadcast","a_bcast",style="success",emoji_id=EMOJI["📣"]),ib("👥 Members","a_members",style="primary",emoji_id=EMOJI["👑"])],
-      [ib("💾 Backup Center","a_backup_menu",style="primary",emoji_id=EMOJI["⚙️"]),ib("♻️ Restore","a_restore",style="danger",emoji_id=EMOJI["✅"])],
-      [ib("🩺 Database Health","a_dbhealth",style="primary",emoji_id=EMOJI["📊"]),ib("❤️ Bot Health","a_health",style="success",emoji_id=EMOJI["🌟"])],
-      [ib("⚙️ Settings","a_settings",style="primary",emoji_id=EMOJI["⚙️"]),ib("🧪 Premium Button Test","a_premium_test",style="success",emoji_id=EMOJI["🌟"])],
-      [ib("📜 Error Log","a_errors",style="primary",emoji_id=EMOJI["📝"]),ib("❌ Close","a_close",style="danger",emoji_id=EMOJI["❌"])]
-    ])
+    items=[]
+    for key in admin_button_keys():
+        b=render_button(key)
+        if b: items.append(b)
+    rows=[]
+    for i in range(0,len(items),2): rows.append(items[i:i+2])
+    return InlineKeyboardMarkup(rows)
 
 async def admin_cmd(update,ctx):
     if not is_admin(update.effective_user.id):return await update.message.reply_text("❌ Not authorized!")
@@ -412,18 +619,62 @@ async def show_channels(q):
     await q.edit_message_text(txt if len(channels(True)) else txt+"No channels configured.",reply_markup=ch_kb(),parse_mode=ParseMode.HTML)
 
 def msg_kb():
-    return InlineKeyboardMarkup([[ib("📢 Top Message","a_top",style="primary",emoji_id=EMOJI["📣"])],[ib("👋 Welcome Message","a_welcome",style="primary",emoji_id=EMOJI["💬"])],[ib("🖼 Welcome Photo","a_welcome_photo",style="success",emoji_id=EMOJI["🖼️"])],[ib("🎉 Post-Join Message","a_postjoin",style="success",emoji_id=EMOJI["🌟"])],[ib("✉️ "+BTN1,"a_btn1",style="primary",emoji_id=EMOJI["🎯"])],[ib("✉️ "+BTN2,"a_btn2",style="success",emoji_id=EMOJI["📊"])],[ib("✉️ "+BTN3,"a_btn3",style="primary",emoji_id=EMOJI["🤝"])],[ib("🔙 Back","a_back",style="primary",emoji_id=EMOJI["📌"])]])
+    return InlineKeyboardMarkup([
+        [ib("📢 Top Message","a_top",style="primary",emoji_id=EMOJI["📣"])],
+        [ib("👋 Welcome Message","a_welcome",style="primary",emoji_id=EMOJI["💬"])],
+        [ib("🖼 Welcome Photo","a_welcome_photo",style="success",emoji_id=EMOJI["🖼️"])],
+        [ib("🎉 Post-Join Message","a_postjoin",style="success",emoji_id=EMOJI["🌟"])],
+        [ib("✉️ "+_legacy_names("btn1"),"a_btn1",style="primary",emoji_id=EMOJI["🎯"])],
+        [ib("✉️ "+_legacy_names("btn2"),"a_btn2",style="success",emoji_id=EMOJI["📊"])],
+        [ib("✉️ "+_legacy_names("btn3"),"a_btn3",style="primary",emoji_id=EMOJI["🤝"])],
+        [ib("🔙 Back","a_back",style="primary",emoji_id=EMOJI["📌"])]
+    ])
+
+def button_config_text(key):
+    cfg=get_button_config(key) or {}
+    return (f"<b>{esc(cfg.get('label',''))}</b>\n"
+            f"Name: <code>{esc(cfg.get('label',''))}</code>\n"
+            f"Normal Emoji: <code>{esc(cfg.get('normal_emoji','') or 'None')}</code>\n"
+            f"Premium Emoji: <code>{esc(cfg.get('premium_emoji_id','') or 'None')}</code>\n"
+            f"Premium: <b>{'ON' if cfg.get('premium_enabled') else 'OFF'}</b>\n"
+            f"Style: <b>{esc(cfg.get('style','primary'))}</b>\n"
+            f"Position: <b>{cfg.get('position',1)}</b>\n"
+            f"Enabled: <b>{'YES' if cfg.get('enabled') else 'NO'}</b>")
 
 def btn_kb():
-    rows=[]
-    for k,n in (("btn1",BTN1),("btn2",BTN2),("btn3",BTN3)):
-        rows += [[ib("🎨 "+n[:16],f"a_style_{k}",style=bstyle(k),emoji_id=bemoji(k)),ib("Style: "+bstyle(k),f"a_style_{k}",style=bstyle(k))],
-                 [ib("🧩 Emoji "+("ON" if bemoji(k) else "OFF"),f"a_emoji_{k}",style="success" if bemoji(k) else "danger",emoji_id=EMOJI["🌟"]),
-                  ib("🆔 Set Emoji ID",f"a_setemoji_{k}",style="primary",emoji_id=EMOJI["📌"]),
-                  ib("👁 Preview",f"a_preview_{k}",style="primary",emoji_id=EMOJI["📌"])],
-                 [ib("↩️ Reset",f"a_reset_{k}",style="danger",emoji_id=EMOJI["❌"])]]
-    rows += [[ib("🧪 Premium Button Test","a_premium_test",style="success",emoji_id=EMOJI["🌟"])],[ib("🔙 Back","a_back",style="primary",emoji_id=EMOJI["📌"])]]
+    rows=[[ib("🌐 Global Premium Emoji: "+("ON" if premium_system_enabled() else "OFF"),"a_global_premium",style="success" if premium_system_enabled() else "danger",emoji_id=EMOJI["👑"])],
+          [ib("👤 Public Buttons","a_public_buttons",style="primary",emoji_id=EMOJI["🎯"]), ib("🛠 Admin Buttons","a_admin_buttons",style="success",emoji_id=EMOJI["⚙️"])],
+          [ib("♻️ Reset All Buttons","a_reset_all",style="danger",emoji_id=EMOJI["❌"])],
+          [ib("🧪 Premium Button Test","a_premium_test",style="success",emoji_id=EMOJI["🌟"])],
+          [ib("🔙 Back","a_back",style="primary",emoji_id=EMOJI["📌"])]]
     return InlineKeyboardMarkup(rows)
+
+def button_list_kb(prefix):
+    keys=public_button_keys() if prefix=="public" else admin_button_keys()
+    rows=[]
+    for key in keys:
+        cfg=get_button_config(key)
+        rows.append([ib((cfg.get("normal_emoji") or "🔘")+" "+cfg["label"][:22],f"a_editbutton_{key}",style=cfg["style"],emoji_id=cfg.get("premium_emoji_id") if cfg.get("premium_enabled") else None)])
+    rows.append([ib("➕ Show Disabled","a_show_disabled_"+prefix,style="primary",emoji_id=EMOJI["📌"])])
+    rows.append([ib("🔙 Back","a_buttons",style="primary",emoji_id=EMOJI["📌"])])
+    return InlineKeyboardMarkup(rows)
+
+def button_editor_kb(key):
+    cfg=get_button_config(key)
+    return InlineKeyboardMarkup([
+        [ib("✏️ Name","a_btnname_"+key,style="primary",emoji_id=EMOJI["📝"]),ib("🧩 Normal Emoji","a_btnnormal_"+key,style="primary",emoji_id=EMOJI["🌟"])],
+        [ib("👑 Premium Emoji","a_btnpremium_"+key,style="success",emoji_id=EMOJI["👑"]),ib("🔘 Premium: "+("ON" if cfg.get("premium_enabled") else "OFF"),"a_btntoggle_"+key,style="success" if cfg.get("premium_enabled") else "danger",emoji_id=EMOJI["✅"] if cfg.get("premium_enabled") else EMOJI["❌"])],
+        [ib("🎨 Style: "+cfg.get("style","primary"),"a_style_"+key,style=cfg.get("style","primary"))],
+        [ib("⬆️ Up","a_moveup_"+key,style="primary",emoji_id=EMOJI["📌"]),ib("⬇️ Down","a_movedown_"+key,style="primary",emoji_id=EMOJI["📌"])],
+        [ib("🟢 Enabled" if cfg.get("enabled") else "🔴 Disabled","a_enable_"+key,style="success" if cfg.get("enabled") else "danger",emoji_id=EMOJI["✅"] if cfg.get("enabled") else EMOJI["❌"])],
+        [ib("👁 Preview","a_preview_"+key,style="primary",emoji_id=EMOJI["📌"]),ib("🧪 Test","a_testbutton_"+key,style="success",emoji_id=EMOJI["🌟"])],
+        [ib("↩️ Reset","a_reset_"+key,style="danger",emoji_id=EMOJI["❌"])],
+        [ib("🔙 Back","a_public_buttons" if not key.startswith("ui_") else "a_admin_buttons",style="primary",emoji_id=EMOJI["📌"])]
+    ])
+
+def render_button_editor_text(key):
+    cfg=get_button_config(key)
+    return "🎨 <b>BUTTON CONFIGURATION</b>\n\n"+button_config_text(key) + "\n\n<b>Current Preview</b>"
 
 def settings_kb():
     def t(k,n):
@@ -465,7 +716,7 @@ def validate_backup(path):
             if ok!="ok" or not req.issubset(tables):raise ValueError("Database integrity/required table validation failed.")
 
 def create_backup():
-    ts=datetime.now().strftime("%Y%m%d_%H%M%S");zip_path=BACKUP_DIR/f"bot_backup_{ts}.zip";tmp=BACKUP_DIR/f".{ts}.db";man=BACKUP_DIR/f".{ts}.txt"
+    ts=datetime.now().strftime("%Y%m%d_%H%M%S_%f");zip_path=BACKUP_DIR/f"bot_backup_{ts}.zip";tmp=BACKUP_DIR/f".{ts}.db";man=BACKUP_DIR/f".{ts}.txt"
     try:
         src=sqlite3.connect(DB_PATH);dst=sqlite3.connect(tmp)
         with dst:src.backup(dst)
@@ -482,28 +733,42 @@ def validate_backup_from_db(p):
     if ok!="ok" or not req.issubset(tables):raise ValueError("Database integrity check failed.")
 
 def restore_backup(path):
+    """Restore a validated SQLite backup without stale WAL/SHM pages."""
     validate_backup(path);safety=create_backup()
-    with zipfile.ZipFile(path) as z,tempfile.TemporaryDirectory() as td:
-        p=Path(td)/"bot2.db"
-        with z.open("bot2.db") as s:
-                with p.open("wb") as p2: shutil.copyfileobj(s,p2)
-        validate_backup_from_db(p)
-        src=sqlite3.connect(p);dst=sqlite3.connect(DB_PATH)
-        with dst:src.backup(dst)
-        src.close();dst.close()
+    live=Path(DB_PATH);live.parent.mkdir(parents=True,exist_ok=True)
+    with zipfile.ZipFile(path) as z,tempfile.TemporaryDirectory(dir=str(live.parent)) as td:
+        restored=Path(td)/"restored.db"
+        with z.open("bot2.db") as src, restored.open("wb") as dst:
+            shutil.copyfileobj(src,dst)
+        validate_backup_from_db(restored)
+        for sidecar in (Path(str(live)+"-wal"),Path(str(live)+"-shm")):
+            try: sidecar.unlink()
+            except FileNotFoundError: pass
+        os.replace(restored,live)
+    init_db()
     sset("last_restore",datetime.now().isoformat());return safety
 
-async def premium_test(bot,chat):
-    eid=EMOJI["🌟"];cb="premium_button_test"
+async def premium_test(bot,chat,key="btn1"):
+    cfg=get_button_config(key) or BUTTON_DEFAULTS["btn1"]
+    b=render_button(key,callback_data="premium_button_test")
+    if not b: b=ib(cfg["label"],"premium_button_test",style=cfg["style"])
+    text=("🧪 <b>Premium Button Test</b>\n\n"
+          f"Selected button: <b>{esc(cfg['label'])}</b>\n"
+          f"Style: <code>{esc(cfg['style'])}</code>\n"
+          f"Premium enabled: <code>{'ON' if cfg.get('premium_enabled') else 'OFF'}</code>\n"
+          f"icon_custom_emoji_id: <code>{esc(cfg.get('premium_emoji_id') or 'None')}</code>\n"
+          f"callback_data: <code>premium_button_test</code>")
     try:
-        kb=InlineKeyboardMarkup([[ib("Premium Button Test",cb,style="success",emoji_id=eid)]])
-        await bot.send_message(chat,"🧪 <b>Premium Button Test</b>\n\nStyle: <code>success</code>\nicon_custom_emoji_id: <code>"+eid+"</code>\ncallback_data: <code>"+cb+"</code>",reply_markup=kb,parse_mode=ParseMode.HTML)
-        return True
-    except TelegramError:
-        try:
-            await bot.send_message(chat,"Custom emoji button is unavailable for this bot/account.\n\nNormal button fallback is active.",reply_markup=InlineKeyboardMarkup([[ib("Premium Button Test",cb,style="success")]]))
-        except TelegramError:logger.exception("Premium fallback failed")
-        return False
+        await bot.send_message(chat,text,reply_markup=InlineKeyboardMarkup([[b]]),parse_mode=ParseMode.HTML);return True
+    except TelegramError as e:
+        if "custom emoji" in str(e).lower() or "icon_custom_emoji_id" in str(e).lower() or "rights" in str(e).lower():
+            log_error("WARNING","Premium test fallback: "+str(e))
+            try:
+                fb=without_premium_markup(InlineKeyboardMarkup([[b]]))
+                await bot.send_message(chat,"⚠️ Premium icon unavailable for this request.\n\nNormal button fallback is active.",reply_markup=fb);return False
+            except TelegramError:logger.exception("Premium test fallback failed")
+        else: raise
+
 
 def backup_list():return sorted(BACKUP_DIR.glob("*.zip"),key=lambda p:p.stat().st_mtime,reverse=True)
 def cleanup_backups():
@@ -602,19 +867,9 @@ async def s_editlink(u,c):
     c.user_data.clear();await u.message.reply_text("✅ Channel updated.",reply_markup=back_kb("a_chs"));return ConversationHandler.END
 
 async def s_emoji(u,c):
-    k=c.user_data.get("emoji_key")
-    if not k:return ConversationHandler.END
-    v=(u.message.text or "").strip()
-    if v.lower()=="clear":
-        sset("button_emoji_"+k,"");sset("button_emoji_enabled_"+k,"0")
-        await u.message.reply_text("🧩 Custom emoji disabled.",reply_markup=back_kb("a_buttons"))
-        c.user_data.clear();return ConversationHandler.END
-    if not v.isdigit():
-        await u.message.reply_text("❌ Custom emoji ID must be numeric.")
-        return S_EMOJI
-    sset("button_emoji_"+k,v);sset("button_emoji_enabled_"+k,"1")
-    await u.message.reply_text("✅ Custom emoji ID saved.",reply_markup=back_kb("a_buttons"))
-    c.user_data.clear();return ConversationHandler.END
+    c.user_data["button_edit_key"]=c.user_data.get("emoji_key") or c.user_data.get("button_edit_key")
+    return await s_button_premium(u,c)
+
 
 async def s_restore(u,c):
     if not is_admin(u.effective_user.id):return ConversationHandler.END
@@ -718,28 +973,89 @@ async def admin_cb(update,ctx):
     if d.startswith("a_editc_"):
         ctx.user_data["edit_channel"]=int(d.split("_")[-1]);await q.edit_message_text("✏️ Send new channel name:");return S_EDITNAME
     if d=="a_msgs":await q.edit_message_text("📝 <b>MESSAGE MANAGEMENT</b>\n\nHTML formatting is preserved.",reply_markup=msg_kb(),parse_mode=ParseMode.HTML);return ConversationHandler.END
-    mm={"a_top":("top","Top Message",S_TOP),"a_welcome":("welcome","Welcome Message",S_WELCOME),"a_postjoin":("postjoin","Post-Join Message",S_POSTJOIN),"a_btn1":("btn1_msg",BTN1,S_BTN1),"a_btn2":("btn2_msg",BTN2,S_BTN2),"a_btn3":("btn3_msg",BTN3,S_BTN3)}
+    mm={"a_top":("top","Top Message",S_TOP),"a_welcome":("welcome","Welcome Message",S_WELCOME),"a_postjoin":("postjoin","Post-Join Message",S_POSTJOIN),"a_btn1":("btn1_msg",_legacy_names("btn1"),S_BTN1),"a_btn2":("btn2_msg",_legacy_names("btn2"),S_BTN2),"a_btn3":("btn3_msg",_legacy_names("btn3"),S_BTN3)}
     if d in mm:
         k,n,s=mm[d];await q.edit_message_text(f"✏️ <b>{esc(n)}</b>\n\nCurrent:\n<pre>{esc(gset(k)[:1500])}</pre>\n\nSend new text.",parse_mode=ParseMode.HTML);return s
     if d=="a_welcome_photo":await q.edit_message_text("🖼 <b>Welcome Photo</b>\n\nSend a photo or <code>clear</code>.",parse_mode=ParseMode.HTML);return S_WELCOME_PHOTO
-    if d=="a_buttons":await q.edit_message_text("🎨 <b>BUTTON MANAGEMENT</b>\n\nprimary=blue, success=green, danger=red.\nCustom emoji uses icon_custom_emoji_id.",reply_markup=btn_kb(),parse_mode=ParseMode.HTML);return ConversationHandler.END
+    if d=="a_buttons":
+        await q.edit_message_text("🎨 <b>BUTTON MANAGEMENT</b>\n\nChoose public buttons or Admin Panel buttons.\nGlobal premium mode can be toggled here.",reply_markup=btn_kb(),parse_mode=ParseMode.HTML);return ConversationHandler.END
+    if d in ("a_public_buttons","a_admin_buttons"):
+        prefix="public" if d=="a_public_buttons" else "admin"
+        title="PUBLIC BUTTONS" if prefix=="public" else "ADMIN PANEL BUTTONS"
+        await q.edit_message_text("🎨 <b>"+title+"</b>\n\nSelect a button to edit its name, normal emoji, premium emoji, premium state, style, order and enabled state.",reply_markup=button_list_kb(prefix),parse_mode=ParseMode.HTML);return ConversationHandler.END
+    if d.startswith("a_show_disabled_"):
+        prefix=d[len("a_show_disabled_"):]
+        keys=[k for k in BUTTON_DEFAULTS if k.startswith("ui_")== (prefix=="admin") and not get_button_config(k).get("enabled")]
+        rows=[]
+        for key in keys: rows.append([ib("🔴 "+get_button_config(key)["label"][:24],"a_editbutton_"+key,style=get_button_config(key)["style"])])
+        rows.append([ib("🔙 Back","a_public_buttons" if prefix=="public" else "a_admin_buttons",style="primary",emoji_id=EMOJI["📌"])])
+        await q.edit_message_text("🎨 <b>DISABLED BUTTONS</b>\n\nSelect a button to edit or re-enable it.",reply_markup=InlineKeyboardMarkup(rows),parse_mode=ParseMode.HTML);return ConversationHandler.END
+    if d.startswith("a_editbutton_"):
+        key=d[len("a_editbutton_"):]
+        if key not in BUTTON_DEFAULTS or not is_admin(q.from_user.id):return ConversationHandler.END
+        txt=render_button_editor_text(key)
+        preview=render_button(key)
+        kb=button_editor_kb(key)
+        await q.edit_message_text(txt,reply_markup=kb,parse_mode=ParseMode.HTML)
+        if preview:
+            await q.message.reply_text("👁 <b>Current Preview</b>",reply_markup=InlineKeyboardMarkup([[preview]]),parse_mode=ParseMode.HTML)
+        return ConversationHandler.END
+    if d.startswith("a_btnname_"):
+        key=d[len("a_btnname_"):]
+        if key not in BUTTON_DEFAULTS:return ConversationHandler.END
+        ctx.user_data["button_edit_key"]=key;await q.edit_message_text("✏️ <b>Edit Button Name</b>\n\nSend the new button name:\n\nCurrent: <code>"+esc(get_button_config(key)["label"])+"</code>",parse_mode=ParseMode.HTML);return S_BTN_NAME
+    if d.startswith("a_btnnormal_"):
+        key=d[len("a_btnnormal_"):]
+        if key not in BUTTON_DEFAULTS:return ConversationHandler.END
+        ctx.user_data["button_edit_key"]=key;await q.edit_message_text("🧩 <b>Set Normal Emoji</b>\n\nSend a normal Unicode emoji such as 🎯 📊 🤝 🔥 ⭐ 💎 🚀.\nSend <code>clear</code> to remove it.\n\nCurrent: <code>"+esc(get_button_config(key).get("normal_emoji") or "None")+"</code>",parse_mode=ParseMode.HTML);return S_BTN_NORMAL
+    if d.startswith("a_btnpremium_"):
+        key=d[len("a_btnpremium_"):]
+        if key not in BUTTON_DEFAULTS:return ConversationHandler.END
+        ctx.user_data["button_edit_key"]=key;await q.edit_message_text("👑 <b>Set Premium Custom Emoji</b>\n\nSend numeric Telegram custom emoji ID.\nExample: <code>5228855127892327218</code>\nSend <code>clear</code> to remove the premium emoji.\n\nCurrent: <code>"+esc(get_button_config(key).get("premium_emoji_id") or "None")+"</code>",parse_mode=ParseMode.HTML);return S_BTN_PREMIUM
+    if d.startswith("a_btntoggle_"):
+        key=d[len("a_btntoggle_"):];cfg=get_button_config(key)
+        save_button_config(key,premium_enabled=not cfg.get("premium_enabled"));await q.edit_message_text("✅ Premium emoji setting updated.",reply_markup=button_editor_kb(key),parse_mode=ParseMode.HTML);return ConversationHandler.END
+    if d=="a_global_premium":
+        sset("premium_emoji_system_enabled","0" if premium_system_enabled() else "1");await q.edit_message_text("🌐 <b>Global Premium Emoji</b> is now <b>"+("ON" if premium_system_enabled() else "OFF")+"</b>.",reply_markup=btn_kb(),parse_mode=ParseMode.HTML);return ConversationHandler.END
     if d.startswith("a_style_"):
-        k=d[len("a_style_"):];n={"primary":"success","success":"danger","danger":"primary"}[bstyle(k)];sset("button_style_"+k,n);await q.edit_message_text("🎨 Button style updated.",reply_markup=btn_kb());return ConversationHandler.END
-    if d.startswith("a_emoji_"):
-        k=d[len("a_emoji_"):];sset("button_emoji_enabled_"+k,"0" if bemoji(k) else "1");await q.edit_message_text("🧩 Button emoji setting updated.",reply_markup=btn_kb());return ConversationHandler.END
+        key=d[len("a_style_"):];cfg=get_button_config(key)
+        nxt={"primary":"success","success":"danger","danger":"primary"}[cfg["style"]];save_button_config(key,style=nxt);await q.edit_message_text("🎨 <b>Style updated</b>\n\nCurrent: <code>"+nxt+"</code>",reply_markup=button_editor_kb(key),parse_mode=ParseMode.HTML);return ConversationHandler.END
+    if d.startswith("a_moveup_") or d.startswith("a_movedown_"):
+        key=d.split("_",2)[2];cfg=get_button_config(key)
+        peers=[k for k in BUTTON_DEFAULTS if (k.startswith("ui_"))==(key.startswith("ui_"))]
+        peers=sorted(peers,key=lambda k:get_button_config(k)["position"])
+        i=peers.index(key);j=i-1 if d.startswith("a_moveup_") else i+1
+        if 0<=j<len(peers):
+            other=peers[j];op=get_button_config(other)["position"];save_button_config(key,position=op);save_button_config(other,position=cfg["position"])
+        await q.edit_message_text(render_button_editor_text(key),reply_markup=button_editor_kb(key),parse_mode=ParseMode.HTML);return ConversationHandler.END
+    if d.startswith("a_enable_"):
+        key=d[len("a_enable_"):];cfg=get_button_config(key);save_button_config(key,enabled=not cfg.get("enabled"));await q.edit_message_text("✅ Button enabled state updated.",reply_markup=button_editor_kb(key),parse_mode=ParseMode.HTML);return ConversationHandler.END
+    if d=="a_reset_all":
+        await q.edit_message_text("⚠️ <b>Are you sure you want to reset ALL button configurations?</b>\n\nOnly button UI configuration will be reset. Users, channels, messages, broadcasts and other data are untouched.",reply_markup=InlineKeyboardMarkup([[ib("✅ Confirm","a_reset_all_confirm",style="danger",emoji_id=EMOJI["❌"]),ib("❌ Cancel","a_buttons",style="primary",emoji_id=EMOJI["📌"])]]),parse_mode=ParseMode.HTML);return ConversationHandler.END
+    if d=="a_reset_all_confirm":
+        try:reset_all_button_configs();await q.edit_message_text("✅ <b>All button configurations reset to defaults.</b>",reply_markup=btn_kb(),parse_mode=ParseMode.HTML)
+        except Exception as e:logger.exception("Reset all buttons");await q.edit_message_text("❌ Reset failed:\n<code>"+esc(e)+"</code>",reply_markup=btn_kb(),parse_mode=ParseMode.HTML)
+        return ConversationHandler.END
     if d.startswith("a_reset_"):
-        k=d[len("a_reset_"):];defs={"btn1":("primary",EMOJI["🎯"]),"btn2":("success",EMOJI["📊"]),"btn3":("primary",EMOJI["🤝"])};st,e=defs[k];sset("button_style_"+k,st);sset("button_emoji_"+k,e);sset("button_emoji_enabled_"+k,"1");await q.edit_message_text("↩️ Button reset.",reply_markup=btn_kb());return ConversationHandler.END
+        key=d[len("a_reset_"):]
+        if key in BUTTON_DEFAULTS:
+            reset_button_config(key);await q.edit_message_text("✅ <b>Button reset to default configuration.</b>",reply_markup=button_editor_kb(key),parse_mode=ParseMode.HTML);return ConversationHandler.END
+        return ConversationHandler.END
     if d.startswith("a_preview_"):
-        k=d[len("a_preview_"):];n={"btn1":BTN1,"btn2":BTN2,"btn3":BTN3}[k];await q.message.reply_text("🎨 Preview",reply_markup=InlineKeyboardMarkup([[ib(n,"preview_"+k,style=bstyle(k),emoji_id=bemoji(k))]]));return ConversationHandler.END
+        key=d[len("a_preview_"):]
+        b=render_button(key)
+        if not b:return await q.answer("Button is disabled.",show_alert=True)
+        await q.message.reply_text("👁 <b>Current Preview</b>",reply_markup=InlineKeyboardMarkup([[b]]),parse_mode=ParseMode.HTML);return ConversationHandler.END
+    if d.startswith("a_testbutton_"):
+        key=d[len("a_testbutton_"):]
+        if key not in BUTTON_DEFAULTS:return ConversationHandler.END
+        ok=await premium_test(ctx.bot,q.message.chat_id,key)
+        if not ok: await q.answer("Premium icon unavailable; fallback sent.",show_alert=True)
+        return ConversationHandler.END
     if d.startswith("a_setemoji_"):
-        k=d[len("a_setemoji_"):]
-        ctx.user_data["emoji_key"]=k
-        await q.edit_message_text(
-            f"🆔 <b>Custom Emoji ID — {esc(k)}</b>\n\n"
-            "Send the numeric Telegram custom emoji ID.\n"
-            "Send <code>clear</code> to disable the ID.",
-            parse_mode=ParseMode.HTML)
-        return S_EMOJI
+        key=d[len("a_setemoji_"):]
+        if key not in BUTTON_DEFAULTS:return ConversationHandler.END
+        ctx.user_data["button_edit_key"]=key;return S_BTN_PREMIUM
     if d=="a_premium_test":
         ok=await premium_test(ctx.bot,q.message.chat_id)
         if not ok:await q.answer("Custom emoji unavailable; fallback sent.",show_alert=True)
@@ -890,15 +1206,14 @@ async def post_shutdown(app):
 
 async def cancel(u,c):c.user_data.clear();await u.message.reply_text("❌ Cancelled.");return ConversationHandler.END
 async def errors(update,ctx):
-    global PREMIUM_EMOJI_ENABLED
     if ctx.error:
         logger.exception("Unhandled exception",exc_info=ctx.error)
-        # If Telegram rejects icon_custom_emoji_id because of account eligibility,
-        # disable premium icons for subsequent keyboards instead of allowing a crash loop.
+        # Never erase or globally disable saved premium configuration because one
+        # button can contain an invalid/unsupported ID. The next explicit render
+        # will still consult SQLite, preserving admin configuration.
         msg=str(ctx.error).lower()
         if "icon_custom_emoji_id" in msg or "custom emoji" in msg or "not enough rights" in msg:
-            PREMIUM_EMOJI_ENABLED=False
-            log_error("ERROR","Premium custom emoji disabled after Telegram rejection: "+str(ctx.error))
+            log_error("ERROR","Premium custom emoji request rejected; saved configuration preserved: "+str(ctx.error))
 
 class RenderHealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -943,7 +1258,7 @@ def main():
         S_WELCOME:[MessageHandler(tf,s_welcome)],S_WELCOME_PHOTO:[MessageHandler((filters.PHOTO|filters.TEXT)&~filters.COMMAND,s_photo)],
         S_POSTJOIN:[MessageHandler(tf,s_postjoin)],S_TOP:[MessageHandler(tf,s_top)],S_BTN1:[MessageHandler(tf,s_btn1)],S_BTN2:[MessageHandler(tf,s_btn2)],S_BTN3:[MessageHandler(tf,s_btn3)],
         S_BCAST:[MessageHandler(bf,start_bcast)],S_RESTORE:[MessageHandler(rf,s_restore)],S_SEARCH:[MessageHandler(tf,s_search)],S_USERMSG:[MessageHandler(bf,s_usermsg)],
-        S_EDITNAME:[MessageHandler(tf,s_editname)],S_EDITLINK:[MessageHandler(tf,s_editlink)],S_EMOJI:[MessageHandler(tf,s_emoji)]
+        S_EDITNAME:[MessageHandler(tf,s_editname)],S_EDITLINK:[MessageHandler(tf,s_editlink)],S_EMOJI:[MessageHandler(tf,s_emoji)],S_BTN_NAME:[MessageHandler(tf,s_button_name)],S_BTN_NORMAL:[MessageHandler(tf,s_button_normal)],S_BTN_PREMIUM:[MessageHandler(tf,s_button_premium)]
       },fallbacks=[CommandHandler("cancel",cancel)],per_chat=False,per_user=True,allow_reentry=True)
     app.add_handler(CommandHandler("start",start));app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(cb_check,pattern=r"^check_joined$"));app.add_handler(CallbackQueryHandler(cb_btn,pattern=r"^btn[123]$"));app.add_handler(CallbackQueryHandler(cb_back,pattern=r"^back_main$"))
