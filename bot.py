@@ -1,4 +1,8 @@
 import asyncio, csv, html, logging, os, sqlite3, tempfile, time, uuid, zipfile, shutil, sys, threading
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote
 from contextlib import contextmanager
@@ -29,6 +33,8 @@ AUTO_BACKUP_TASK = None
 PREMIUM_EMOJI_ENABLED = True
 HTTP_SERVER = None
 HTTP_SERVER_THREAD = None
+INSTANCE_LOCK_FILE = None
+INSTANCE_LOCK_FH = None
 
 BTN1, BTN2, BTN3 = "🎯 Claim Agent", "📊 Statistics", "🤝 Refer & Earn"
 EMOJI = {"🎯": "5228855127892327218", "📊": "6093382540784046658", "🤝": "6086990448331592466", "📣": "6095891759462617671", "💬": "6095865895169560113", "📝": "6010292709066019210", "🖼️": "5341285075210224047", "➕": "6093406373557571574", "❌": "6010471186432005118", "⚙️": "6010355840790303830", "✅": "6246537187614005254", "🌟": "5783170625090622777", "📌": "6089019283508040459", "🔔": "6093852083788715042", "👑": "6247039939305808563", "💰": "5785325680765965100"}
@@ -716,11 +722,21 @@ def validate_backup(path):
             if ok!="ok" or not req.issubset(tables):raise ValueError("Database integrity/required table validation failed.")
 
 def create_backup():
+    """Create a consistent SQLite backup without touching Telegram polling.
+
+    The backup is fully local: it does not call the Telegram API and must never
+    start/stop the application or interfere with getUpdates polling.
+    """
     ts=datetime.now().strftime("%Y%m%d_%H%M%S_%f");zip_path=BACKUP_DIR/f"bot_backup_{ts}.zip";tmp=BACKUP_DIR/f".{ts}.db";man=BACKUP_DIR/f".{ts}.txt"
     try:
-        src=sqlite3.connect(DB_PATH);dst=sqlite3.connect(tmp)
-        with dst:src.backup(dst)
-        src.close();dst.close()
+        src=sqlite3.connect(DB_PATH, timeout=30)
+        dst=sqlite3.connect(tmp, timeout=30)
+        try:
+            src.execute("PRAGMA busy_timeout=30000")
+            dst.execute("PRAGMA busy_timeout=30000")
+            with dst:src.backup(dst, pages=256, sleep=0.05)
+        finally:
+            src.close();dst.close()
         validate_backup_from_db(tmp)
         man.write_text(f"Telegram Bot Backup\nBackup Date: {datetime.now().isoformat()}\nDatabase Version: {DB_VERSION}\nBot Version: {BOT_VERSION}\nDatabase Name: {Path(DB_PATH).name}\nSecrets: BOT_TOKEN is NOT included.\n",encoding="utf-8")
         with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:z.write(tmp,"bot2.db");z.write(man,"manifest.txt")
@@ -1184,9 +1200,13 @@ async def admin_cb(update,ctx):
         await q.edit_message_text("💾 <b>BACKUP CENTER</b>\n\n"+names,reply_markup=InlineKeyboardMarkup([[ib("💾 Create Backup","a_backup",style="success",emoji_id=EMOJI["⚙️"])],[ib("📤 Download Latest","a_download",style="primary",emoji_id=EMOJI["📌"])],[ib("🗑 Delete Old Backups","a_cleanup",style="danger",emoji_id=EMOJI["❌"])],[ib("🔙 Back","a_back",style="primary",emoji_id=EMOJI["📌"])] ]),parse_mode=ParseMode.HTML);return ConversationHandler.END
     if d=="a_backup":
         try:
+            await q.answer("💾 Creating backup…")
             p=create_backup()
-            with p.open("rb") as f:await q.message.reply_document(f,filename=p.name,caption="💾 Backup Ready")
-        except Exception as e:logger.exception("Backup");await q.answer("Backup failed.",show_alert=True)
+            with p.open("rb") as f:
+                await q.message.reply_document(f,filename=p.name,caption="💾 Backup Ready")
+        except Exception as e:
+            logger.exception("Backup creation failed")
+            await q.answer("❌ Backup failed. Check Render logs.",show_alert=True)
         return ConversationHandler.END
     if d=="a_download":
         ps=backup_list()
@@ -1317,9 +1337,50 @@ def stop_render_health_server():
         except Exception: pass
         HTTP_SERVER=None
 
+def acquire_instance_lock():
+    """Prevent accidental duplicate bot processes on the same Render instance."""
+    global INSTANCE_LOCK_FILE, INSTANCE_LOCK_FH
+    lock_path = os.getenv("BOT_INSTANCE_LOCK", ".bot-instance.lock")
+    INSTANCE_LOCK_FILE = lock_path
+    try:
+        fh = open(lock_path, "a+")
+        if fcntl is None:
+            INSTANCE_LOCK_FH = fh
+            logger.warning("Instance lock opened, but OS file locking is unavailable on this platform.")
+            return True
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logger.critical("Another bot process is already running in this service. Refusing to start a second polling process.")
+            fh.close()
+            return False
+        fh.write(str(os.getpid()))
+        fh.flush()
+        INSTANCE_LOCK_FH = fh
+        return True
+    except Exception as e:
+        logger.exception("Unable to acquire bot instance lock: %s", e)
+        return False
+
+def release_instance_lock():
+    global INSTANCE_LOCK_FH
+    if INSTANCE_LOCK_FH:
+        try:
+            if fcntl is not None:
+                fcntl.flock(INSTANCE_LOCK_FH.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            INSTANCE_LOCK_FH.close()
+        except Exception:
+            pass
+        INSTANCE_LOCK_FH = None
+
 def main():
     if not BOT_TOKEN:raise RuntimeError("BOT_TOKEN is missing. Set BOT_TOKEN environment variable.")
     if not ADMIN_ID:raise RuntimeError("ADMIN_ID is missing or invalid. Set ADMIN_ID environment variable.")
+    if not acquire_instance_lock():
+        raise RuntimeError("A second bot polling process was detected on this service. Stop the duplicate process/service before starting this bot.")
     init_db()
     app=(Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(post_shutdown).build())
     tf=filters.TEXT & ~filters.COMMAND
@@ -1340,8 +1401,16 @@ def main():
     start_render_health_server()
     logger.info("Bot started: v%s / PTB %s / ADMIN_ID=%s / OWNER_ID=%s",BOT_VERSION,telegram.__version__,ADMIN_ID,OWNER_ID)
     try:
-        app.run_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=True)
+        try:
+            app.run_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=True)
+        except telegram.error.Conflict:
+            logger.critical(
+                "Telegram 409 Conflict: another getUpdates polling process is using this BOT_TOKEN. "
+                "Stop every other deployment/local bot using this token and keep exactly ONE Render instance/process."
+            )
+            raise
     finally:
         stop_render_health_server()
+        release_instance_lock()
 
 if __name__=="__main__":main()
