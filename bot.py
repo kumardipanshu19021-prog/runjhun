@@ -866,6 +866,80 @@ async def s_editlink(u,c):
         update_channel(cid,link=v)
     c.user_data.clear();await u.message.reply_text("✅ Channel updated.",reply_markup=back_kb("a_chs"));return ConversationHandler.END
 
+async def s_button_name(u,c):
+    """Save the custom display name for the selected managed button."""
+    key=c.user_data.get("button_edit_key")
+    if not key or key not in BUTTON_DEFAULTS:
+        c.user_data.clear()
+        await u.message.reply_text("❌ Button edit session expired. Please open the button editor again.",reply_markup=back_kb("a_buttons"))
+        return ConversationHandler.END
+    value=(u.message.text or "").strip()
+    if not value:
+        await u.message.reply_text("❌ Button name cannot be empty. Send a name or press Back.",reply_markup=back_kb(f"a_editbutton_{key}"))
+        return S_BTN_NAME
+    save_button_config(key,label=value)
+    await u.message.reply_text("✅ <b>Button name updated.</b>\n\n"+render_button_editor_text(key),reply_markup=button_editor_kb(key),parse_mode=ParseMode.HTML)
+    c.user_data.clear()
+    return ConversationHandler.END
+
+async def s_button_normal(u,c):
+    """Save a normal Unicode emoji for the selected managed button."""
+    key=c.user_data.get("button_edit_key")
+    if not key or key not in BUTTON_DEFAULTS:
+        c.user_data.clear()
+        await u.message.reply_text("❌ Button edit session expired. Please open the button editor again.",reply_markup=back_kb("a_buttons"))
+        return ConversationHandler.END
+    value=(u.message.text or "").strip()
+    if value.lower()=="clear":
+        value=""
+    elif len(value)>16:
+        await u.message.reply_text("❌ Please send one normal Unicode emoji, or <code>clear</code>.",reply_markup=back_kb(f"a_editbutton_{key}"),parse_mode=ParseMode.HTML)
+        return S_BTN_NORMAL
+    save_button_config(key,normal_emoji=value)
+    await u.message.reply_text("✅ <b>Normal emoji updated.</b>\n\n"+render_button_editor_text(key),reply_markup=button_editor_kb(key),parse_mode=ParseMode.HTML)
+    c.user_data.clear()
+    return ConversationHandler.END
+
+async def s_button_premium(u,c):
+    """Accept either a numeric custom-emoji ID or a Telegram custom emoji message.
+
+    Telegram sends a custom emoji in text with a MessageEntity whose type is
+    ``custom_emoji`` and whose ``custom_emoji_id`` contains the ID.
+    """
+    key=c.user_data.get("button_edit_key")
+    if not key or key not in BUTTON_DEFAULTS:
+        c.user_data.clear()
+        await u.message.reply_text("❌ Button edit session expired. Please open the button editor again.",reply_markup=back_kb("a_buttons"))
+        return ConversationHandler.END
+
+    raw=(u.message.text or u.message.caption or "").strip()
+    if raw.lower()=="clear":
+        save_button_config(key,premium_emoji_id="",premium_enabled=False)
+        await u.message.reply_text("✅ <b>Premium custom emoji cleared.</b>\n\n"+render_button_editor_text(key),reply_markup=button_editor_kb(key),parse_mode=ParseMode.HTML)
+        c.user_data.clear()
+        return ConversationHandler.END
+
+    custom_id=None
+    entities=list(u.message.entities or [])+list(u.message.caption_entities or [])
+    for entity in entities:
+        etype=str(getattr(entity,"type","")).lower()
+        if etype.endswith("custom_emoji") or etype=="custom_emoji":
+            candidate=getattr(entity,"custom_emoji_id",None)
+            if candidate:
+                custom_id=str(candidate)
+                break
+    if not custom_id and raw.isdigit():
+        custom_id=raw
+
+    if not custom_id:
+        await u.message.reply_text("❌ Could not detect a Telegram Custom Emoji ID.\n\nSend the premium/custom emoji itself, or send its numeric ID.\n\nYou can also send <code>clear</code> to remove it.",reply_markup=back_kb(f"a_editbutton_{key}"),parse_mode=ParseMode.HTML)
+        return S_BTN_PREMIUM
+
+    save_button_config(key,premium_emoji_id=custom_id,premium_enabled=True)
+    await u.message.reply_text("✅ <b>Premium custom emoji updated.</b>\n\nDetected ID: <code>"+esc(custom_id)+"</code>\n\n"+render_button_editor_text(key),reply_markup=button_editor_kb(key),parse_mode=ParseMode.HTML)
+    c.user_data.clear()
+    return ConversationHandler.END
+
 async def s_emoji(u,c):
     c.user_data["button_edit_key"]=c.user_data.get("emoji_key") or c.user_data.get("button_edit_key")
     return await s_button_premium(u,c)
