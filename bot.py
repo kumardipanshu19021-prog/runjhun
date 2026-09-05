@@ -349,7 +349,8 @@ def save_button_config(key, **changes):
     if cfg.get("style") not in BUTTON_STYLES: raise ValueError("Invalid button style.")
     cfg["premium_emoji_id"]="" if str(cfg.get("premium_emoji_id","")).strip().lower()=="clear" else str(cfg.get("premium_emoji_id","")).strip()
     if cfg["premium_emoji_id"] and not cfg["premium_emoji_id"].isdigit(): raise ValueError("Premium Emoji ID must be numeric.")
-    cfg["normal_emoji"]=str(cfg.get("normal_emoji","") or "").strip()[:16]
+    cfg["normal_emoji"]=""
+    cfg["premium_enabled"]=True
     cfg["position"]=max(1,int(cfg.get("position",1)))
     cfg["enabled"]=bool(cfg.get("enabled",True))
     with db() as c: c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",(BUTTON_CONFIG_PREFIX+key,_config_to_json(cfg)))
@@ -377,7 +378,11 @@ def public_button_keys():
 
 
 def admin_button_keys():
-    return sorted((k for k in BUTTON_DEFAULTS if k.startswith("ui_") and get_button_config(k).get("enabled")),key=lambda k:get_button_config(k)["position"])
+    # Only real Admin Dashboard controls belong on the dashboard.
+    # Force-join controls and the global Back control are rendered only in
+    # their own contexts; exposing them here creates dead buttons such as
+    # "{name}" / "Joined" on the admin home screen.
+    return sorted((k for k in BUTTON_DEFAULTS if k.startswith("ui_a_") and get_button_config(k).get("enabled")),key=lambda k:get_button_config(k)["position"])
 
 
 def premium_system_enabled():
@@ -561,6 +566,8 @@ def join_kb(rows,joined):
         if not r[6] or r[1] in joined:
             continue
         label=template.replace("{name}",str(r[2]))
+        if not label.strip() or label.strip()=="{name}":
+            label=str(r[2])
         pending.append(ib(label,url=r[3],style=style,emoji_id=icon))
     for i in range(0,len(pending),2):
         out.append(pending[i:i+2])
@@ -713,7 +720,7 @@ def button_config_text(key):
     return (f"<b>{esc(cfg.get('label',''))}</b>\n"
             f"Name: <code>{esc(cfg.get('label',''))}</code>\n"
             f"Premium Emoji: <code>{esc(cfg.get('premium_emoji_id','') or 'None')}</code>\n"
-            f"Premium: <b>{'ON' if cfg.get('premium_enabled') else 'OFF'}</b>\n"
+            f"Premium Emoji Mode: <b>ON</b>\n"
             f"Style: <b>{esc(cfg.get('style','primary'))}</b>\n"
             f"Position: <b>{cfg.get('position',1)}</b>\n"
             f"Enabled: <b>{'YES' if cfg.get('enabled') else 'NO'}</b>")
@@ -741,7 +748,7 @@ def button_editor_kb(key):
     cfg=get_button_config(key)
     return InlineKeyboardMarkup([
         [ib("Name","a_btnname_"+key,style="primary",emoji_id=EMOJI["📝"])],
-        [ib("Premium Emoji","a_btnpremium_"+key,style="success",emoji_id=EMOJI["👑"]),ib("Premium: "+("ON" if cfg.get("premium_enabled") else "OFF"),"a_btntoggle_"+key,style="success" if cfg.get("premium_enabled") else "danger",emoji_id=EMOJI["✅"] if cfg.get("premium_enabled") else EMOJI["❌"])],
+        [ib("Premium Emoji","a_btnpremium_"+key,style="success",emoji_id=EMOJI["👑"])],
         [ib("Style: "+cfg.get("style","primary"),"a_style_"+key,style=cfg.get("style","primary"),emoji_id=EMOJI["🌟"])],
         [ib("Up","a_moveup_"+key,style="primary",emoji_id=EMOJI["📌"]),ib("Down","a_movedown_"+key,style="primary",emoji_id=EMOJI["📌"])],
         [ib("Enabled" if cfg.get("enabled") else "Disabled","a_enable_"+key,style="success" if cfg.get("enabled") else "danger",emoji_id=EMOJI["✅"] if cfg.get("enabled") else EMOJI["❌"])],
@@ -781,17 +788,69 @@ def safe_zip(z):
         p=Path(n)
         if p.is_absolute() or ".." in p.parts:raise ValueError("Unsafe backup archive: path traversal detected.")
 
+def migrate_database_file(path):
+    """Bring a legacy SQLite backup forward without touching the live DB."""
+    c=sqlite3.connect(path,timeout=30,check_same_thread=False)
+    try:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY,first_name TEXT DEFAULT '',username TEXT DEFAULT '',joined_at TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active');
+        CREATE TABLE IF NOT EXISTS channels(id INTEGER PRIMARY KEY AUTOINCREMENT,channel_id TEXT UNIQUE NOT NULL,channel_name TEXT NOT NULL,channel_link TEXT NOT NULL,position INTEGER DEFAULT 0,order_num INTEGER DEFAULT 0,enabled INTEGER NOT NULL DEFAULT 1);
+        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
+        CREATE TABLE IF NOT EXISTS join_requests(user_id INTEGER NOT NULL,channel_id TEXT NOT NULL,requested_at TEXT,status TEXT DEFAULT 'active',PRIMARY KEY(user_id,channel_id));
+        CREATE TABLE IF NOT EXISTS broadcast_msgs(bcast_id TEXT NOT NULL,user_id INTEGER NOT NULL,message_id INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS broadcasts(bcast_id TEXT PRIMARY KEY,created_at TEXT,source_chat_id INTEGER,source_message_id INTEGER,kind TEXT,total INTEGER DEFAULT 0,sent INTEGER DEFAULT 0,failed INTEGER DEFAULT 0,cancelled INTEGER DEFAULT 0,status TEXT DEFAULT 'running',last_error TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS error_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,created_at TEXT,level TEXT,message TEXT);
+        CREATE TABLE IF NOT EXISTS referrals(referral_id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER UNIQUE NOT NULL,referrer_id INTEGER NOT NULL,created_at TEXT NOT NULL);
+        """)
+        for table,required in {
+            "users":("username","status"),
+            "channels":("enabled",),
+            "join_requests":("requested_at","status"),
+        }.items():
+            cols={r[1] for r in c.execute("PRAGMA table_info("+table+")")}
+            for col in required:
+                if col in cols: continue
+                if table=="users" and col=="username": c.execute("ALTER TABLE users ADD COLUMN username TEXT DEFAULT ''")
+                elif table=="users" and col=="status": c.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+                elif table=="channels" and col=="enabled": c.execute("ALTER TABLE channels ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+                elif table=="join_requests" and col=="requested_at": c.execute("ALTER TABLE join_requests ADD COLUMN requested_at TEXT")
+                elif table=="join_requests" and col=="status": c.execute("ALTER TABLE join_requests ADD COLUMN status TEXT DEFAULT 'active'")
+        c.execute("UPDATE join_requests SET requested_at=COALESCE(requested_at,datetime('now'))")
+        c.commit()
+    finally:
+        c.close()
+
+def _find_backup_db(z):
+    """Locate the SQLite database inside current or legacy backup archives."""
+    names=[n for n in z.namelist() if not n.endswith("/") and Path(n).name.lower() not in {"manifest.txt","backup_manifest.txt"}]
+    if "bot2.db" in names:
+        return "bot2.db"
+    # Legacy backups may use bot.db, database.db, *.sqlite, etc. Identify the
+    # database by its SQLite file signature rather than trusting the filename.
+    for name in names:
+        try:
+            with z.open(name) as f:
+                if f.read(16).startswith(b"SQLite format 3\x00"):
+                    return name
+        except Exception:
+            continue
+    raise ValueError("Backup archive does not contain a SQLite database.")
 def validate_backup(path):
-    with zipfile.ZipFile(path) as z:
-        safe_zip(z)
-        if z.testzip() is not None or not {"bot2.db","manifest.txt"}.issubset(set(z.namelist())):raise ValueError("Invalid backup archive.")
-        with tempfile.TemporaryDirectory() as td:
-            p=Path(td)/"bot2.db"
-            with z.open("bot2.db") as s:
-                with p.open("wb") as p2: shutil.copyfileobj(s,p2)
-            c=sqlite3.connect(p);ok=c.execute("PRAGMA integrity_check").fetchone()[0];tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")};c.close()
-            req={"users","channels","settings","join_requests","broadcast_msgs","broadcasts","error_logs","referrals"}
-            if ok!="ok" or not req.issubset(tables):raise ValueError("Database integrity/required table validation failed.")
+    try:
+        with zipfile.ZipFile(path) as z:
+            safe_zip(z)
+            if z.testzip() is not None:
+                raise ValueError("Backup archive contains a damaged file.")
+            db_name=_find_backup_db(z)
+            with tempfile.TemporaryDirectory() as td:
+                p=Path(td)/"restore_check.db"
+                with z.open(db_name) as src, p.open("wb") as dst:
+                    shutil.copyfileobj(src,dst)
+                migrate_database_file(p)
+                validate_backup_from_db(p)
+            return db_name
+    except zipfile.BadZipFile as e:
+        raise ValueError("Invalid backup ZIP file.") from e
 
 def create_backup():
     """Create a consistent SQLite backup without touching Telegram polling.
@@ -830,20 +889,46 @@ def validate_backup_from_db(p):
     if ok!="ok" or not req.issubset(tables):raise ValueError("Database integrity check failed.")
 
 def restore_backup(path):
-    """Restore a validated SQLite backup without stale WAL/SHM pages."""
-    validate_backup(path);safety=create_backup()
+    """Safely restore a current or legacy SQLite backup.
+
+    The uploaded archive is validated first. A current live-state safety backup
+    is created before the swap. Legacy archives are accepted when their SQLite
+    database is valid; init_db() then performs the normal schema migrations.
+    """
+    db_name=validate_backup(path)
+    safety=create_backup()
     live=Path(DB_PATH);live.parent.mkdir(parents=True,exist_ok=True)
-    with zipfile.ZipFile(path) as z,tempfile.TemporaryDirectory(dir=str(live.parent)) as td:
-        restored=Path(td)/"restored.db"
-        with z.open("bot2.db") as src, restored.open("wb") as dst:
-            shutil.copyfileobj(src,dst)
-        validate_backup_from_db(restored)
-        for sidecar in (Path(str(live)+"-wal"),Path(str(live)+"-shm")):
-            try: sidecar.unlink()
-            except FileNotFoundError: pass
-        os.replace(restored,live)
-    init_db()
-    sset("last_restore",datetime.now().isoformat());return safety
+    previous=Path(str(live)+".restore_previous")
+    try:
+        with zipfile.ZipFile(path) as z,tempfile.TemporaryDirectory(dir=str(live.parent)) as td:
+            restored=Path(td)/"restored.db"
+            with z.open(db_name) as src, restored.open("wb") as dst:
+                shutil.copyfileobj(src,dst)
+            migrate_database_file(restored)
+            validate_backup_from_db(restored)
+            # Keep a byte-for-byte rollback copy until the new DB is initialized.
+            if live.exists():
+                shutil.copy2(live,previous)
+            for sidecar in (Path(str(live)+"-wal"),Path(str(live)+"-shm")):
+                sidecar.unlink(missing_ok=True)
+            os.replace(restored,live)
+        # Apply schema migrations to older backups and verify the resulting DB.
+        init_db()
+        validate_backup_from_db(live)
+        sset("last_restore",datetime.now().isoformat())
+        previous.unlink(missing_ok=True)
+        return safety
+    except Exception:
+        # Roll back automatically if the restored DB cannot be initialized/validated.
+        try:
+            if previous.exists():
+                for sidecar in (Path(str(live)+"-wal"),Path(str(live)+"-shm")):
+                    sidecar.unlink(missing_ok=True)
+                os.replace(previous,live)
+                init_db()
+        except Exception:
+            logger.exception("Restore rollback failed")
+        raise
 
 async def premium_test(bot,chat,key="btn1"):
     cfg=get_button_config(key) or BUTTON_DEFAULTS["btn1"]
@@ -1084,7 +1169,7 @@ async def s_restore(u,c):
         f=await c.bot.get_file(d.file_id)
         with tempfile.NamedTemporaryFile(suffix=".zip",delete=False) as t:p=t.name
         await f.download_to_drive(p);safety=restore_backup(p)
-        await u.message.reply_text("✅ <b>Restore completed.</b>\n\n🔐 Safety backup created.\n🔄 Restart bot to apply restored state.",parse_mode=ParseMode.HTML)
+        await u.message.reply_text("✅ <b>Restore completed.</b>\n\n🔐 Safety backup created.\n♻️ Restored configuration and database are now active.",parse_mode=ParseMode.HTML)
     except Exception as e:logger.exception("Restore");await u.message.reply_text("❌ Restore failed:\n<code>"+esc(e)+"</code>",parse_mode=ParseMode.HTML)
     finally:
         if p:
@@ -1205,7 +1290,7 @@ async def admin_cb(update,ctx):
         await q.edit_message_text("🎨 <b>"+title+"</b>\n\nSelect a button to edit its name, premium custom emoji, premium state, style, order and enabled state.",reply_markup=button_list_kb(prefix),parse_mode=ParseMode.HTML);return ConversationHandler.END
     if d.startswith("a_show_disabled_"):
         prefix=d[len("a_show_disabled_"):]
-        keys=[k for k in BUTTON_DEFAULTS if k.startswith("ui_")== (prefix=="admin") and not get_button_config(k).get("enabled")]
+        keys=[k for k in BUTTON_DEFAULTS if ((k.startswith("ui_a_") and prefix=="admin") or (not k.startswith("ui_") and prefix=="public")) and not get_button_config(k).get("enabled")]
         rows=[]
         for key in keys: rows.append([ib(get_button_config(key)["label"][:28],"a_editbutton_"+key,style=get_button_config(key)["style"],emoji_id=get_button_config(key).get("premium_emoji_id"))])
         rows.append([back_button("a_public_buttons" if prefix=="public" else "a_admin_buttons")])
@@ -1256,7 +1341,7 @@ async def admin_cb(update,ctx):
         nxt={"primary":"success","success":"danger","danger":"primary"}[cfg["style"]];save_button_config(key,style=nxt);await q.edit_message_text("🎨 <b>Style updated</b>\n\nCurrent: <code>"+nxt+"</code>",reply_markup=button_editor_kb(key),parse_mode=ParseMode.HTML);return ConversationHandler.END
     if d.startswith("a_moveup_") or d.startswith("a_movedown_"):
         key=d.split("_",2)[2];cfg=get_button_config(key)
-        peers=[k for k in BUTTON_DEFAULTS if (k.startswith("ui_"))==(key.startswith("ui_"))]
+        peers=[k for k in BUTTON_DEFAULTS if (k.startswith("ui_a_") and key.startswith("ui_a_")) or (not k.startswith("ui_") and not key.startswith("ui_"))]
         peers=sorted(peers,key=lambda k:get_button_config(k)["position"])
         i=peers.index(key);j=i-1 if d.startswith("a_moveup_") else i+1
         if 0<=j<len(peers):
