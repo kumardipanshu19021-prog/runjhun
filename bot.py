@@ -334,6 +334,11 @@ def get_request_status(uid,cid):
 async def verify_channel_membership(bot,user_id,channel_id):
     cid=str(channel_id).strip()
     result={"state":"unknown","is_member":False,"request_pending":False,"error":None}
+    # A recorded pending join request is sufficient to pass Force Join.
+    # Do not approve it here; the user still has to press Verify.
+    if get_request_status(user_id,cid)=="pending":
+        result.update(state="pending",request_pending=True,is_member=True)
+        return result
     try:
         m=await bot.get_chat_member(cid,user_id)
         status=str(getattr(m,"status","") or "").lower()
@@ -344,11 +349,17 @@ async def verify_channel_membership(bot,user_id,channel_id):
         elif status in ("kicked","banned"):
             result["state"]="kicked"
         elif status in ("pending","join_request"):
+            # Compatibility with API variants that expose a pending state.
             result.update(state="pending",request_pending=True,is_member=True)
         else:
             result["state"]="unknown"
         return result
     except Exception as e:
+        # If Telegram cannot return membership details, a locally recorded
+        # pending request is still enough to let the user press Verify.
+        if get_request_status(user_id,cid)=="pending":
+            result.update(state="pending",request_pending=True,is_member=True,error=None)
+            return result
         result.update(state="api_error",error=str(e))
         return result
 
@@ -794,6 +805,8 @@ async def render_force_join(bot,chat_id,user_id=None,rows=None,verification=None
     remaining=verification.get("remaining",[])
     text=get_force_join_message()
     kb=join_kb(remaining,set(verification.get("joined",set())))
+    # Keep the configured Welcome Photo on the initial Force Join screen.
+    # It is removed only when verification succeeds and the main menu opens.
     photo=str(gset("welcome_photo","") or "").strip()
     photo_enabled=gset("welcome_photo_enabled","1")=="1"
 
@@ -810,12 +823,12 @@ async def render_force_join(bot,chat_id,user_id=None,rows=None,verification=None
             raise TelegramError("Cannot edit an existing text message to empty content.")
         if photo and photo_enabled:
             kwargs={"chat_id":chat_id,"photo":photo,"reply_markup":markup}
-            if text: kwargs.update(caption=text,parse_mode=ParseMode.HTML)
+            if text:
+                kwargs.update(caption=text,parse_mode=ParseMode.HTML)
             return await bot.send_photo(**kwargs)
         if not text:
             raise TelegramError(
-                "Force Join message is empty and no photo is configured; "
-                "Telegram does not support a keyboard-only message.")
+                "Force Join message is empty; Telegram does not support a keyboard-only message.")
         return await bot.send_message(
             chat_id=chat_id,text=text,reply_markup=markup,parse_mode=ParseMode.HTML)
 
@@ -857,7 +870,8 @@ async def start(update,ctx):
         return await update.message.reply_text(post or " ",reply_markup=main_kb(),parse_mode=ParseMode.HTML)
 
     verification=await verify_required_channels(ctx.bot,u.id,rows)
-    if verification["all_verified"]:
+    has_pending_request=any(r.get("request_pending") for r in verification.get("results",[]))
+    if verification["all_verified"] and not has_pending_request:
         ctx.user_data.pop("force_join_message_id",None)
         ctx.user_data.pop("force_join_message_photo",None)
         post=str(gset("postjoin","") or "").strip()
@@ -898,11 +912,15 @@ async def cb_check(update,ctx):
         post=str(gset("postjoin","") or "").strip();visible=post or " "
         try:
             if getattr(q.message,"photo",None):
-                await q.edit_message_caption(caption=post or None,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
+                await q.message.delete()
+                await ctx.bot.send_message(q.message.chat_id,visible,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
             else:
                 await q.edit_message_text(visible,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
         except TelegramError:
-            await ctx.bot.send_message(q.message.chat_id,visible,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
+            try:
+                await ctx.bot.send_message(q.message.chat_id,visible,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
+            except TelegramError:
+                pass
         return
 
     await q.answer("Please join the remaining required channel(s) and press Joined again.",show_alert=True)
@@ -943,21 +961,9 @@ async def join_request(update,ctx):
     if r:
         uid = r.from_user.id
         cid = r.chat.id
+        # Record the request only. Never auto-approve it and never advance
+        # the user to the main menu from a join-request update.
         record_req(uid, cid)
-
-        try:
-            await r.approve()
-        except telegram.error.TelegramError:
-            pass
-
-        rows = channels(False)
-        verification = await verify_required_channels(ctx.bot, uid, rows)
-        if verification["all_verified"]:
-            post = str(gset("postjoin", "") or "").strip()
-            try:
-                await ctx.bot.send_message(uid, post or " ", reply_markup=main_kb(), parse_mode=telegram.constants.ParseMode.HTML)
-            except telegram.error.TelegramError:
-                pass
 
 async def chat_member_update(update,ctx):
     cmu=update.chat_member
@@ -968,16 +974,9 @@ async def chat_member_update(update,ctx):
         new_status=str(getattr(cmu.new_chat_member,"status","") or "").lower()
 
         if new_status in ("member","administrator","creator","restricted"):
+            # Membership updates only synchronize request state. The user is
+            # moved to the main menu only by the explicit Verify button.
             mark_req(uid,cid)
-
-            rows = channels(False)
-            verification = await verify_required_channels(ctx.bot, uid, rows)
-            if verification["all_verified"]:
-                post = str(gset("postjoin", "") or "").strip()
-                try:
-                    await ctx.bot.send_message(uid, post or " ", reply_markup=main_kb(), parse_mode=telegram.constants.ParseMode.HTML)
-                except telegram.error.TelegramError:
-                    pass
 
         elif new_status in ("left","kicked","banned"):
             with db() as c:
