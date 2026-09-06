@@ -23,7 +23,7 @@ try: OWNER_ID = int(os.getenv("OWNER_ID", str(ADMIN_ID)).strip())
 except ValueError: OWNER_ID = ADMIN_ID
 DB_PATH = os.getenv("DB_PATH", "bot2.db").strip() or "bot2.db"
 BACKUP_DIR = Path(os.getenv("BACKUP_DIR", "backups")); BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-BOT_VERSION, DB_VERSION = "4.2.0", 6
+BOT_VERSION, DB_VERSION = "4.3.0", 7
 STARTED_AT = time.monotonic()
 LAST_ERROR = ""
 ERROR_LOG_MAX = 200
@@ -45,7 +45,7 @@ logger = logging.getLogger("force_join_bot")
 
 # Conversation states
 (S_CH_ID,S_CH_NAME,S_CH_LINK,S_WELCOME,S_WELCOME_PHOTO,S_POSTJOIN,S_TOP,S_BTN1,S_BTN2,S_BTN3,
- S_BCAST,S_RESTORE,S_SEARCH,S_USERMSG,S_EDITNAME,S_EDITLINK,S_EMOJI,S_BTN_NAME,S_BTN_NORMAL,S_BTN_PREMIUM)=range(20)
+ S_BCAST,S_RESTORE,S_SEARCH,S_USERMSG,S_EDITNAME,S_EDITLINK,S_EMOJI,S_BTN_NAME,S_BTN_NORMAL,S_BTN_PREMIUM,S_FORCE_JOIN_MSG)=range(21)
 
 @contextmanager
 def db():
@@ -153,6 +153,16 @@ def sanitize_database_values(conn):
         eid=str(cfg.get("premium_emoji_id","") or "")
         conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",(key,eid))
 
+def migrate_force_join_message_setting(conn):
+    """Create the dedicated Force Join message once, preserving legacy configured copy."""
+    row=conn.execute("SELECT 1 FROM settings WHERE key='force_join_message'").fetchone()
+    if row:
+        return
+    top=str((conn.execute("SELECT value FROM settings WHERE key='top'").fetchone() or [""])[0] or "").strip()
+    welcome=str((conn.execute("SELECT value FROM settings WHERE key='welcome'").fetchone() or [""])[0] or "").strip()
+    legacy="\n\n".join(x for x in (top,welcome) if x)
+    conn.execute("INSERT INTO settings(key,value) VALUES('force_join_message',?)",(legacy,))
+
 def init_db():
     with db() as c:
         c.executescript("""
@@ -176,9 +186,7 @@ def init_db():
         if "status" not in cols: c.execute("ALTER TABLE join_requests ADD COLUMN status TEXT DEFAULT 'active'")
         c.execute("UPDATE join_requests SET requested_at=COALESCE(requested_at,?)",(datetime.now().isoformat(),))
         defaults={
-          # No hard-coded join/instruction text. Admin-configured content is the only
-          # visible welcome content. An invisible placeholder is used only when a
-          # keyboard must be attached without configured text/photo.
+          # Force Join text is stored separately; empty is a valid configuration.
           "welcome":"",
           "welcome_photo":"","postjoin":"🏛️ <b>Welcome!</b>\n\n📋 <b>Rules</b>\n• One agent per user\n• Permanent assignment","top":"",
           "btn1_msg":"🎯 Agent claim coming soon!","btn2_msg":"📊 Statistics coming soon!","btn3_msg":"🤝 Refer & Earn coming soon!",
@@ -193,6 +201,7 @@ def init_db():
           "joined_button_premium_emoji_id":EMOJI["✅"],
         }
         for k,v in defaults.items(): c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(k,str(v)))
+        migrate_force_join_message_setting(c)
         migrate_button_configs(c)
         sanitize_database_values(c)
 
@@ -270,27 +279,38 @@ def move_channel(cid,direction):
         c.execute("UPDATE channels SET order_num=? WHERE id=?",(rows[i][5],rows[j][0]))
 
 def record_req(uid,cid):
-    with db() as c:c.execute("INSERT OR REPLACE INTO join_requests VALUES(?,?,?,?)",(uid,str(cid),datetime.now().isoformat(),"active"))
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO join_requests(user_id,channel_id,requested_at,status) VALUES(?,?,?,?)",(uid,str(cid),datetime.now().isoformat(),"pending"))
+
 def mark_req(uid,cid):
-    with db() as c:c.execute("UPDATE join_requests SET status='joined' WHERE user_id=? AND channel_id=?",(uid,str(cid)))
+    with db() as c:
+        c.execute("UPDATE join_requests SET status='verified' WHERE user_id=? AND channel_id=?",(uid,str(cid)))
+
 def has_req(uid,cid):
-    return bool(scalar("SELECT 1 FROM join_requests WHERE user_id=? AND channel_id=? AND status IN ('active','joined')",(uid,str(cid)),0))
+    # Compatibility only. A request is never membership proof.
+    return bool(scalar("SELECT 1 FROM join_requests WHERE user_id=? AND channel_id=? AND status IN ('pending','approved','verified')",(uid,str(cid)),0))
 
 async def check_joined(bot,uid):
-    # Admin/owner accounts are never blocked by their own force-join gate.
     if is_admin(uid):return True,set()
     if gset("force_join_enabled","1")!="1":return True,set()
     rows=channels(False)
     if not rows:return True,set()
     joined=set()
     for r in rows:
-        cid=r[1]
+        cid=str(r[1]).strip()
         try:
             m=await bot.get_chat_member(cid,uid)
-            if m.status in ("member","administrator","creator","restricted"):
-                joined.add(cid);mark_req(uid,cid);continue
-        except TelegramError as e:logger.warning("Join check %s/%s: %s",cid,uid,e)
-        if has_req(uid,cid):joined.add(cid)
+            status=str(getattr(m,"status","") or "")
+            member=status in ("member","administrator","creator","restricted")
+            logger.info("ForceJoin verify user=%s channel=%s status=%s result=%s",uid,cid,status,member)
+            if member:
+                joined.add(cid);mark_req(uid,cid)
+        except RetryAfter as e:
+            logger.warning("ForceJoin verify retry-after user=%s channel=%s seconds=%s",uid,cid,getattr(e,"retry_after",None))
+        except Forbidden as e:
+            logger.warning("ForceJoin verify forbidden user=%s channel=%s: %s",uid,cid,e)
+        except TelegramError as e:
+            logger.warning("ForceJoin verify API error user=%s channel=%s: %s",uid,cid,e)
     return len(joined)==len(rows),joined
 
 async def channel_status(bot,cid):
@@ -649,11 +669,6 @@ def process_referral(new_user_id, args):
     except sqlite3.IntegrityError:
         return False
 
-def welcome_text():
-    """Return only the text the admin has explicitly configured."""
-    parts=[str(gset("top","") or "").strip(),str(gset("welcome","") or "").strip()]
-    return "\n\n".join(p for p in parts if p)
-
 def main_kb():
     keys=public_button_keys()
     buttons=[render_button(k) for k in keys]
@@ -691,58 +706,86 @@ def join_kb(rows,joined):
         out.append([check])
     return safe_markup(out)
 
-async def send_welcome(bot,chat,text,kb):
-    try:
-        text=str(text or "").strip()
-        p=gset("welcome_photo")
-        if p and gset("welcome_photo_enabled","1")=="1":
-            kwargs={"chat_id":chat,"photo":p,"reply_markup":kb}
+def get_force_join_message():
+    return str(gset("force_join_message","") or "").strip()
+
+async def render_force_join(bot,chat_id,rows=None,joined=None,existing_message=None):
+    rows=channels(False) if rows is None else rows
+    joined=set() if joined is None else set(joined)
+    text=get_force_join_message()
+    kb=join_kb(rows,joined)
+    photo=str(gset("welcome_photo","") or "").strip()
+    photo_enabled=gset("welcome_photo_enabled","1")=="1"
+
+    async def do_render(markup):
+        if existing_message is not None:
+            if getattr(existing_message,"photo",None):
+                return await bot.edit_message_caption(chat_id=chat_id,message_id=existing_message.message_id,caption=text or None,reply_markup=markup,parse_mode=ParseMode.HTML)
             if text:
-                kwargs.update(caption=text,parse_mode=ParseMode.HTML)
-            await bot.send_photo(**kwargs)
-        else:
-            # Telegram requires message text, so use an invisible character only
-            # when no admin-configured content exists. It is not visible to users.
-            await bot.send_message(chat,text=text or "\u2063",reply_markup=kb,parse_mode=ParseMode.HTML)
-    except TelegramError as e:logger.error("Welcome send failed: %s",e)
+                return await bot.edit_message_text(chat_id=chat_id,message_id=existing_message.message_id,text=text,reply_markup=markup,parse_mode=ParseMode.HTML)
+            raise TelegramError("Force Join message is empty and Telegram cannot make an existing text message truly empty")
+        if photo and photo_enabled:
+            kwargs={"chat_id":chat_id,"photo":photo,"reply_markup":markup}
+            if text: kwargs.update(caption=text,parse_mode=ParseMode.HTML)
+            return await bot.send_photo(**kwargs)
+        if not text:
+            raise TelegramError("Force Join requires a configured message or photo because Telegram cannot send a keyboard-only text message")
+        return await bot.send_message(chat_id=chat_id,text=text,reply_markup=markup,parse_mode=ParseMode.HTML)
+
+    try:
+        return await do_render(kb)
+    except TelegramError as e:
+        if any(token in str(e).lower() for token in ("custom emoji","icon_custom_emoji_id","custom_emoji_id")):
+            logger.warning("ForceJoin custom emoji rejected; retrying without premium icons: %s",e)
+            return await do_render(without_premium_markup(kb))
+        raise
 
 async def start(update,ctx):
     u=update.effective_user
     if not u:return
     is_new=add_user(u)
-    if is_new and ctx.args:
-        process_referral(u.id,ctx.args)
+    if is_new and ctx.args: process_referral(u.id,ctx.args)
     if user_status(u.id)=="blocked":return await update.message.reply_text("🚫 You are blocked from using this bot.")
     if gset("maintenance_mode","0")=="1" and not is_admin(u.id):return await update.message.reply_text("🛠 Bot is under maintenance.")
     rows=channels(False);ok,joined=await check_joined(ctx.bot,u.id)
     if not rows or ok:
+        ctx.user_data.pop("force_join_message_id",None)
         post=str(gset("postjoin","") or "").strip()
-        if post:
-            return await update.message.reply_text(post,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
-        # Do not inject a hard-coded post-join message. Show the configured main
-        # buttons only when the admin has left post-join content empty.
-        return await update.message.reply_text("\u2063",reply_markup=main_kb())
-    await send_welcome(ctx.bot,u.id,welcome_text(),join_kb(rows,joined))
+        if post:return await update.message.reply_text(post,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
+        return await update.message.reply_text(" ",reply_markup=main_kb())
+    old_id=ctx.user_data.get("force_join_message_id")
+    if old_id:
+        try:
+            await render_force_join(ctx.bot,u.id,rows,joined,existing_message=SimpleNamespace(message_id=old_id,photo=False))
+            return
+        except TelegramError:ctx.user_data.pop("force_join_message_id",None)
+    try:
+        m=await render_force_join(ctx.bot,u.id,rows,joined)
+        if m and getattr(m,"message_id",None):ctx.user_data["force_join_message_id"]=m.message_id
+    except TelegramError as e:
+        logger.error("ForceJoin send failed user=%s: %s",u.id,e)
 
 async def cb_check(update,ctx):
     q=update.callback_query;uid=q.from_user.id
     if user_status(uid)=="blocked":return await q.answer("🚫 You are blocked.",show_alert=True)
-    await q.answer(); rows=channels(False);ok,joined=await check_joined(ctx.bot,uid)
+    rows=channels(False);ok,joined=await check_joined(ctx.bot,uid)
     if ok:
-        post=str(gset("postjoin","") or "").strip()
-        visible_post=post or "\u2063"
+        await q.answer("✅ Verified")
+        ctx.user_data.pop("force_join_message_id",None)
+        post=str(gset("postjoin","") or "").strip();visible=post or " "
         try:
             if getattr(q.message,"photo",None):
                 await q.edit_message_caption(caption=post or None,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
             else:
-                await q.edit_message_text(visible_post,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
+                await q.edit_message_text(visible,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
         except TelegramError:
-            await ctx.bot.send_message(q.message.chat_id,visible_post,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
-    else:
-        await q.answer("Join the remaining required channel(s) and press Joined again.",show_alert=True)
-        try:await q.message.delete()
-        except TelegramError:pass
-        await send_welcome(ctx.bot,q.message.chat_id,welcome_text(),join_kb(rows,joined))
+            await ctx.bot.send_message(q.message.chat_id,visible,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
+        return
+    await q.answer("Please join all required channels and press Joined again.",show_alert=True)
+    try:
+        await render_force_join(ctx.bot,q.message.chat_id,rows,joined,existing_message=q.message)
+    except TelegramError as e:
+        logger.warning("ForceJoin re-render failed user=%s: %s",uid,e)
 
 async def cb_btn(update,ctx):
     q=update.callback_query
@@ -770,7 +813,9 @@ async def cb_back(update,ctx):
     except TelegramError:await ctx.bot.send_message(q.message.chat_id,gset("postjoin"),reply_markup=main_kb(),parse_mode=ParseMode.HTML)
 async def join_request(update,ctx):
     r=update.chat_join_request
-    if r:record_req(r.from_user.id,r.chat.id)
+    if r:
+        record_req(r.from_user.id,r.chat.id)
+        logger.info("JoinRequest recorded user=%s channel=%s status=pending",r.from_user.id,r.chat.id)
 
 def dash():
     now=datetime.now();today=now.date().isoformat();week=(now-timedelta(days=now.weekday())).date().isoformat()
@@ -831,6 +876,7 @@ def msg_kb():
         [ib("📢 Top Message","a_top",style="primary",emoji_id=EMOJI["📣"])],
         [ib("👋 Welcome Message","a_welcome",style="primary",emoji_id=EMOJI["💬"])],
         [ib("🖼 Welcome Photo","a_welcome_photo",style="success",emoji_id=EMOJI["🖼️"])],
+        [ib("📝 Force Join Message","a_forcejoin_message",style="primary",emoji_id=EMOJI["📝"])],
         [ib("🎉 Post-Join Message","a_postjoin",style="success",emoji_id=EMOJI["🌟"])],
         [ib("✉️ "+_legacy_names("btn1"),"a_btn1",style="primary",emoji_id=EMOJI["🎯"])],
         [ib("✉️ "+_legacy_names("btn2"),"a_btn2",style="success",emoji_id=EMOJI["📊"])],
@@ -925,6 +971,7 @@ def migrate_database_file(path):
         CREATE TABLE IF NOT EXISTS error_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,created_at TEXT,level TEXT,message TEXT);
         CREATE TABLE IF NOT EXISTS referrals(referral_id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER UNIQUE NOT NULL,referrer_id INTEGER NOT NULL,created_at TEXT NOT NULL);
         """)
+        migrate_force_join_message_setting(c)
         for table,required in {
             "users":("username","status"),
             "channels":("enabled",),
@@ -1297,6 +1344,15 @@ async def s_button_premium(u,c):
     c.user_data.clear()
     return ConversationHandler.END
 
+async def s_force_join_message(u,c):
+    if not is_admin(u.effective_user.id):
+        c.user_data.clear(); return ConversationHandler.END
+    raw=(u.message.text_html if getattr(u.message,"text_html",None) is not None else (u.message.text or "")).strip()
+    if raw.lower()=="clear": raw=""
+    sset("force_join_message",raw)
+    await u.message.reply_text("✅ <b>Force Join message updated.</b>" if raw else "✅ <b>Force Join message cleared.</b>",reply_markup=back_kb("a_joinbuttons"),parse_mode=ParseMode.HTML)
+    return ConversationHandler.END
+
 async def s_emoji(u,c):
     c.user_data["button_edit_key"]=c.user_data.get("emoji_key") or c.user_data.get("button_edit_key")
     return await s_button_premium(u,c)
@@ -1410,6 +1466,25 @@ async def admin_cb(update,ctx):
     if d=="a_welcome_photo":await q.edit_message_text("🖼 <b>Welcome Photo</b>\n\nSend a photo or <code>clear</code>.",reply_markup=back_kb("a_msgs"),parse_mode=ParseMode.HTML);return S_WELCOME_PHOTO
     if d=="a_buttons":
         await q.edit_message_text("🎨 <b>BUTTON MANAGEMENT</b>\n\nChoose public, admin, or force-join buttons. All visible buttons use premium custom emoji only.",reply_markup=btn_kb(),parse_mode=ParseMode.HTML);return ConversationHandler.END
+    if d=="a_forcejoin_message":
+        current=get_force_join_message()
+        await q.edit_message_text("📝 <b>FORCE JOIN MESSAGE</b>\n\nThis is the only custom instruction text shown on Force Join.\nSend replacement text or <code>clear</code> to make it empty.\n\nCurrent:\n<pre>"+esc(current[:3000])+"</pre>",reply_markup=back_kb("a_joinbuttons"),parse_mode=ParseMode.HTML)
+        return S_FORCE_JOIN_MSG
+    if d=="a_forcejoin_clear":
+        sset("force_join_message","")
+        await q.edit_message_text("✅ <b>Force Join message cleared.</b>",reply_markup=back_kb("a_joinbuttons"),parse_mode=ParseMode.HTML)
+        return ConversationHandler.END
+    if d=="a_forcejoin_reset":
+        sset("force_join_message","")
+        await q.edit_message_text("✅ <b>Force Join message reset.</b>",reply_markup=back_kb("a_joinbuttons"),parse_mode=ParseMode.HTML)
+        return ConversationHandler.END
+    if d=="a_forcejoin_preview":
+        sample=[(1,"-100000000001","Channel 1","https://t.me/example1",0,1,1),(2,"-100000000002","Channel 2","https://t.me/example2",0,2,1)]
+        try:
+            await render_force_join(ctx.bot,q.message.chat_id,rows=sample,joined=set())
+        except TelegramError as e:
+            logger.warning("ForceJoin preview failed: %s",e)
+        return ConversationHandler.END
     if d=="a_joinbuttons":
         jc=get_button_config("ui_join_channel") or BUTTON_DEFAULTS["ui_join_channel"]
         jj=get_button_config("ui_join_check") or BUTTON_DEFAULTS["ui_join_check"]
@@ -1424,6 +1499,9 @@ async def admin_cb(update,ctx):
             [ib("Channel Premium Emoji","a_join_emoji",style="success",emoji_id=EMOJI["👑"])],
             [ib("Verify Button Name","a_joined_name",style="primary",emoji_id=EMOJI["📝"])],
             [ib("Verify Premium Emoji","a_joined_emoji",style="success",emoji_id=EMOJI["👑"])],
+            [ib("Edit Force Join Message","a_forcejoin_message",style="primary",emoji_id=EMOJI["📝"] )],
+            [ib("Preview Force Join","a_forcejoin_preview",style="success",emoji_id=EMOJI["📌"])],
+            [ib("Clear Force Join Message","a_forcejoin_clear",style="danger",emoji_id=EMOJI["❌"]),ib("Reset Force Join","a_forcejoin_reset",style="danger",emoji_id=EMOJI["❌"])],
             [back_button("a_buttons")]])
         await q.edit_message_text(txt,reply_markup=kb,parse_mode=ParseMode.HTML);return ConversationHandler.END
     if d in ("a_public_buttons","a_admin_buttons"):
@@ -1801,7 +1879,7 @@ def main():
         S_WELCOME:[MessageHandler(tf,s_welcome)],S_WELCOME_PHOTO:[MessageHandler((filters.PHOTO|filters.TEXT)&~filters.COMMAND,s_photo)],
         S_POSTJOIN:[MessageHandler(tf,s_postjoin)],S_TOP:[MessageHandler(tf,s_top)],S_BTN1:[MessageHandler(tf,s_btn1)],S_BTN2:[MessageHandler(tf,s_btn2)],S_BTN3:[MessageHandler(tf,s_btn3)],
         S_BCAST:[MessageHandler(bf,start_bcast)],S_RESTORE:[MessageHandler(rf,s_restore)],S_SEARCH:[MessageHandler(tf,s_search)],S_USERMSG:[MessageHandler(bf,s_usermsg)],
-        S_EDITNAME:[MessageHandler(tf,s_editname)],S_EDITLINK:[MessageHandler(tf,s_editlink)],S_EMOJI:[MessageHandler(tf,s_emoji)],S_BTN_NAME:[MessageHandler(tf,s_button_name)],S_BTN_NORMAL:[MessageHandler(tf,s_button_normal)],S_BTN_PREMIUM:[MessageHandler(tf,s_button_premium)]
+        S_EDITNAME:[MessageHandler(tf,s_editname)],S_EDITLINK:[MessageHandler(tf,s_editlink)],S_EMOJI:[MessageHandler(tf,s_emoji)],S_BTN_NAME:[MessageHandler(tf,s_button_name)],S_BTN_NORMAL:[MessageHandler(tf,s_button_normal)],S_BTN_PREMIUM:[MessageHandler(tf,s_button_premium)],S_FORCE_JOIN_MSG:[MessageHandler(tf,s_force_join_message)]
       },fallbacks=[CommandHandler("cancel",cancel),CallbackQueryHandler(admin_cb,pattern=r"^a_")],per_chat=False,per_user=True,allow_reentry=True)
     app.add_handler(CommandHandler("start",start));app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(cb_check,pattern=r"^check_joined$"));app.add_handler(CallbackQueryHandler(cb_btn,pattern=r"^btn[123]$"));app.add_handler(CallbackQueryHandler(cb_back,pattern=r"^back_main$"))
