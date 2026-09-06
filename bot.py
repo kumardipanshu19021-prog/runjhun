@@ -14,7 +14,7 @@ import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup as TelegramMarkup
 from telegram.constants import ParseMode, ChatAction
 from telegram.error import TelegramError, RetryAfter, Forbidden
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler, ChatJoinRequestHandler
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler, ChatJoinRequestHandler, ChatMemberHandler
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 try: ADMIN_ID = int(os.getenv("ADMIN_ID", "0").strip())
@@ -942,6 +942,29 @@ async def join_request(update,ctx):
     if r:
         record_req(r.from_user.id,r.chat.id)
         logger.info("JoinRequest recorded user=%s channel=%s status=pending",r.from_user.id,r.chat.id)
+
+async def chat_member_update(update,ctx):
+    """Passive listener only: records the membership state Telegram itself reports
+    (e.g. after a human admin approves a pending join request, or the user leaves).
+    This NEVER approves/declines requests and NEVER grants membership on its own —
+    it only keeps join_requests.status in sync with what Telegram has already decided,
+    so the 'Joined' check reflects reality as fast as possible."""
+    cmu=update.chat_member
+    if not cmu:
+        return
+    try:
+        uid=cmu.new_chat_member.user.id
+        cid=str(cmu.chat.id)
+        new_status=str(getattr(cmu.new_chat_member,"status","") or "").lower()
+        if new_status in ("member","administrator","creator","restricted"):
+            mark_req(uid,cid)
+            logger.info("ChatMemberUpdate user=%s channel=%s status=%s -> marked verified",uid,cid,new_status)
+        elif new_status in ("left","kicked","banned"):
+            with db() as c:
+                c.execute("UPDATE join_requests SET status='pending' WHERE user_id=? AND channel_id=? AND status='verified'",(uid,cid))
+            logger.info("ChatMemberUpdate user=%s channel=%s status=%s -> membership ended",uid,cid,new_status)
+    except Exception as e:
+        logger.warning("chat_member_update handling failed: %s",e)
 
 def dash():
     now=datetime.now();today=now.date().isoformat();week=(now-timedelta(days=now.weekday())).date().isoformat()
@@ -2010,7 +2033,9 @@ def main():
       },fallbacks=[CommandHandler("cancel",cancel),CallbackQueryHandler(admin_cb,pattern=r"^a_")],per_chat=False,per_user=True,allow_reentry=True)
     app.add_handler(CommandHandler("start",start));app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(cb_check,pattern=r"^check_joined$"));app.add_handler(CallbackQueryHandler(cb_btn,pattern=r"^btn[123]$"));app.add_handler(CallbackQueryHandler(cb_back,pattern=r"^back_main$"))
-    app.add_handler(ChatJoinRequestHandler(join_request));app.add_error_handler(errors)
+    app.add_handler(ChatJoinRequestHandler(join_request))
+    app.add_handler(ChatMemberHandler(chat_member_update,ChatMemberHandler.CHAT_MEMBER))
+    app.add_error_handler(errors)
     start_render_health_server()
     logger.info("Bot started: v%s / PTB %s / ADMIN_ID=%s / OWNER_ID=%s",BOT_VERSION,telegram.__version__,ADMIN_ID,OWNER_ID)
     try:
