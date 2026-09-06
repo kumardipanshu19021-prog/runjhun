@@ -332,39 +332,25 @@ def get_request_status(uid,cid):
 
 
 async def verify_channel_membership(bot,user_id,channel_id):
-    """Telegram-current authoritative membership verification for one channel."""
     cid=str(channel_id).strip()
     result={"state":"unknown","is_member":False,"request_pending":False,"error":None}
     try:
         m=await bot.get_chat_member(cid,user_id)
         status=str(getattr(m,"status","") or "").lower()
-        if status in ("member","administrator","creator"):
+        if status in ("member","administrator","creator", "restricted"):
             result.update(state=status,is_member=True)
-        elif status=="restricted":
-            result.update(state="restricted",is_member=True)
         elif status=="left":
             result["state"]="left"
         elif status in ("kicked","banned"):
             result["state"]="kicked"
         elif status in ("pending","join_request"):
-            result.update(state="pending",request_pending=True)
+            result.update(state="pending",request_pending=True,is_member=True)
         else:
             result["state"]="unknown"
-        logger.info(
-            "ForceJoin verify user=%s channel=%s telegram_status=%s request_status=%s verified=%s",
-            user_id,cid,status,get_request_status(user_id,cid),result["is_member"])
         return result
-    except RetryAfter as e:
-        result.update(state="api_error",error=f"retry_after:{getattr(e,'retry_after',None)}")
-    except Forbidden as e:
-        result.update(state="api_error",error=str(e))
-    except TelegramError as e:
-        result.update(state="api_error",error=str(e))
     except Exception as e:
         result.update(state="api_error",error=str(e))
-    logger.warning("ForceJoin verify user=%s channel=%s state=%s error=%s",
-                   user_id,cid,result["state"],result["error"])
-    return result
+        return result
 
 
 async def verify_required_channels(bot,user_id,rows=None):
@@ -955,31 +941,49 @@ async def cb_back(update,ctx):
 async def join_request(update,ctx):
     r=update.chat_join_request
     if r:
-        record_req(r.from_user.id,r.chat.id)
-        logger.info("JoinRequest recorded user=%s channel=%s status=pending",r.from_user.id,r.chat.id)
+        uid = r.from_user.id
+        cid = r.chat.id
+        record_req(uid, cid)
+
+        try:
+            await r.approve()
+        except telegram.error.TelegramError:
+            pass
+
+        rows = channels(False)
+        verification = await verify_required_channels(ctx.bot, uid, rows)
+        if verification["all_verified"]:
+            post = str(gset("postjoin", "") or "").strip()
+            try:
+                await ctx.bot.send_message(uid, post or " ", reply_markup=main_kb(), parse_mode=telegram.constants.ParseMode.HTML)
+            except telegram.error.TelegramError:
+                pass
 
 async def chat_member_update(update,ctx):
-    """Passive listener only: records the membership state Telegram itself reports
-    (e.g. after a human admin approves a pending join request, or the user leaves).
-    This NEVER approves/declines requests and NEVER grants membership on its own —
-    it only keeps join_requests.status in sync with what Telegram has already decided,
-    so the 'Joined' check reflects reality as fast as possible."""
     cmu=update.chat_member
-    if not cmu:
-        return
+    if not cmu: return
     try:
         uid=cmu.new_chat_member.user.id
         cid=str(cmu.chat.id)
         new_status=str(getattr(cmu.new_chat_member,"status","") or "").lower()
+
         if new_status in ("member","administrator","creator","restricted"):
             mark_req(uid,cid)
-            logger.info("ChatMemberUpdate user=%s channel=%s status=%s -> marked verified",uid,cid,new_status)
+
+            rows = channels(False)
+            verification = await verify_required_channels(ctx.bot, uid, rows)
+            if verification["all_verified"]:
+                post = str(gset("postjoin", "") or "").strip()
+                try:
+                    await ctx.bot.send_message(uid, post or " ", reply_markup=main_kb(), parse_mode=telegram.constants.ParseMode.HTML)
+                except telegram.error.TelegramError:
+                    pass
+
         elif new_status in ("left","kicked","banned"):
             with db() as c:
                 c.execute("UPDATE join_requests SET status='pending' WHERE user_id=? AND channel_id=? AND status='verified'",(uid,cid))
-            logger.info("ChatMemberUpdate user=%s channel=%s status=%s -> membership ended",uid,cid,new_status)
-    except Exception as e:
-        logger.warning("chat_member_update handling failed: %s",e)
+    except Exception:
+        pass
 
 def dash():
     now=datetime.now();today=now.date().isoformat();week=(now-timedelta(days=now.weekday())).date().isoformat()
