@@ -23,7 +23,7 @@ try: OWNER_ID = int(os.getenv("OWNER_ID", str(ADMIN_ID)).strip())
 except ValueError: OWNER_ID = ADMIN_ID
 DB_PATH = os.getenv("DB_PATH", "bot2.db").strip() or "bot2.db"
 BACKUP_DIR = Path(os.getenv("BACKUP_DIR", "backups")); BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-BOT_VERSION, DB_VERSION = "4.3.0", 7
+BOT_VERSION, DB_VERSION = "4.4.0", 8
 STARTED_AT = time.monotonic()
 LAST_ERROR = ""
 ERROR_LOG_MAX = 200
@@ -154,14 +154,37 @@ def sanitize_database_values(conn):
         conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",(key,eid))
 
 def migrate_force_join_message_setting(conn):
-    """Create the dedicated Force Join message once, preserving legacy configured copy."""
-    row=conn.execute("SELECT 1 FROM settings WHERE key='force_join_message'").fetchone()
-    if row:
-        return
-    top=str((conn.execute("SELECT value FROM settings WHERE key='top'").fetchone() or [""])[0] or "").strip()
-    welcome=str((conn.execute("SELECT value FROM settings WHERE key='welcome'").fetchone() or [""])[0] or "").strip()
-    legacy="\n\n".join(x for x in (top,welcome) if x)
-    conn.execute("INSERT INTO settings(key,value) VALUES('force_join_message',?)",(legacy,))
+    """Create the dedicated Force Join message without importing legacy welcome/top text."""
+    row=conn.execute("SELECT value FROM settings WHERE key='force_join_message'").fetchone()
+    if not row:
+        conn.execute("INSERT INTO settings(key,value) VALUES('force_join_message','')")
+    elif row[0] is None:
+        conn.execute("UPDATE settings SET value='' WHERE key='force_join_message'")
+
+def migrate_force_join_legacy_state(conn):
+    """Idempotently neutralize legacy Force Join state without touching business data."""
+    legacy_keys=(
+        "old_force_join_message","join_message","welcome_join_message",
+        "force_join_instruction","legacy_force_join","start_message",
+    )
+    placeholders=",".join("?" for _ in legacy_keys)
+    conn.execute(f"DELETE FROM settings WHERE key IN ({placeholders})",legacy_keys)
+    conn.execute("""
+        UPDATE join_requests
+        SET status=CASE
+            WHEN lower(COALESCE(status,''))='active' THEN 'pending'
+            WHEN lower(COALESCE(status,''))='joined' THEN 'legacy_verified'
+            WHEN lower(COALESCE(status,'')) IN
+                ('pending','approved','declined','cancelled','verified','legacy_verified')
+                THEN lower(status)
+            ELSE 'pending'
+        END
+    """)
+    conn.execute("""
+        DELETE FROM join_requests
+        WHERE user_id NOT IN (SELECT user_id FROM users)
+           OR channel_id NOT IN (SELECT channel_id FROM channels)
+    """)
 
 def init_db():
     with db() as c:
@@ -202,6 +225,7 @@ def init_db():
         }
         for k,v in defaults.items(): c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(k,str(v)))
         migrate_force_join_message_setting(c)
+        migrate_force_join_legacy_state(c)
         migrate_button_configs(c)
         sanitize_database_values(c)
 
@@ -290,28 +314,89 @@ def has_req(uid,cid):
     # Compatibility only. A request is never membership proof.
     return bool(scalar("SELECT 1 FROM join_requests WHERE user_id=? AND channel_id=? AND status IN ('pending','approved','verified')",(uid,str(cid)),0))
 
-async def check_joined(bot,uid):
-    if is_admin(uid):return True,set()
-    if gset("force_join_enabled","1")!="1":return True,set()
-    rows=channels(False)
-    if not rows:return True,set()
-    joined=set()
+def get_request_status(uid,cid):
+    try:
+        with db() as c:
+            row=c.execute(
+                "SELECT status FROM join_requests WHERE user_id=? AND channel_id=?",
+                (uid,str(cid))).fetchone()
+        return str(row[0]).lower() if row and row[0] else None
+    except Exception as e:
+        logger.warning("Join request status lookup failed user=%s channel=%s: %s",uid,cid,e)
+        return None
+
+
+async def verify_channel_membership(bot,user_id,channel_id):
+    """Telegram-current authoritative membership verification for one channel."""
+    cid=str(channel_id).strip()
+    result={"state":"unknown","is_member":False,"request_pending":False,"error":None}
+    try:
+        m=await bot.get_chat_member(cid,user_id)
+        status=str(getattr(m,"status","") or "").lower()
+        if status in ("member","administrator","creator"):
+            result.update(state=status,is_member=True)
+        elif status=="restricted":
+            result.update(state="restricted",is_member=True)
+        elif status=="left":
+            result["state"]="left"
+        elif status in ("kicked","banned"):
+            result["state"]="kicked"
+        elif status in ("pending","join_request"):
+            result.update(state="pending",request_pending=True)
+        else:
+            result["state"]="unknown"
+        logger.info(
+            "ForceJoin verify user=%s channel=%s telegram_status=%s request_status=%s verified=%s",
+            user_id,cid,status,get_request_status(user_id,cid),result["is_member"])
+        return result
+    except RetryAfter as e:
+        result.update(state="api_error",error=f"retry_after:{getattr(e,'retry_after',None)}")
+    except Forbidden as e:
+        result.update(state="api_error",error=str(e))
+    except TelegramError as e:
+        result.update(state="api_error",error=str(e))
+    except Exception as e:
+        result.update(state="api_error",error=str(e))
+    logger.warning("ForceJoin verify user=%s channel=%s state=%s error=%s",
+                   user_id,cid,result["state"],result["error"])
+    return result
+
+
+async def verify_required_channels(bot,user_id,rows=None):
+    """Check every enabled required channel exactly once per verification cycle."""
+    rows=channels(False) if rows is None else [r for r in rows if r[6]]
+    joined=set();remaining=[];results=[];all_verified=True
     for r in rows:
         cid=str(r[1]).strip()
-        try:
-            m=await bot.get_chat_member(cid,uid)
-            status=str(getattr(m,"status","") or "")
-            member=status in ("member","administrator","creator","restricted")
-            logger.info("ForceJoin verify user=%s channel=%s status=%s result=%s",uid,cid,status,member)
-            if member:
-                joined.add(cid);mark_req(uid,cid)
-        except RetryAfter as e:
-            logger.warning("ForceJoin verify retry-after user=%s channel=%s seconds=%s",uid,cid,getattr(e,"retry_after",None))
-        except Forbidden as e:
-            logger.warning("ForceJoin verify forbidden user=%s channel=%s: %s",uid,cid,e)
-        except TelegramError as e:
-            logger.warning("ForceJoin verify API error user=%s channel=%s: %s",uid,cid,e)
-    return len(joined)==len(rows),joined
+        if not cid:
+            all_verified=False
+            remaining.append(r)
+            results.append({"channel":r,"channel_id":cid,"state":"unknown",
+                            "is_member":False,"request_pending":False,"error":"empty channel id"})
+            continue
+        result=await verify_channel_membership(bot,user_id,cid)
+        result["channel"]=r
+        results.append(result)
+        if result["is_member"]:
+            joined.add(cid)
+            mark_req(user_id,cid)
+        else:
+            all_verified=False
+            remaining.append(r)
+    logger.info("ForceJoin verification cycle user=%s all_verified=%s remaining_channels=%s",
+                user_id,all_verified,[str(r[1]) for r in remaining])
+    return {"all_verified":all_verified,"joined":joined,"remaining":remaining,"results":results}
+
+
+async def check_joined(bot,uid):
+    """Backward-compatible wrapper; DB requests never participate in membership proof."""
+    if is_admin(uid) or gset("force_join_enabled","1")!="1":
+        return True,set()
+    rows=channels(False)
+    if not rows:
+        return True,set()
+    v=await verify_required_channels(bot,uid,rows)
+    return v["all_verified"],v["joined"]
 
 async def channel_status(bot,cid):
     try:
@@ -709,33 +794,46 @@ def join_kb(rows,joined):
 def get_force_join_message():
     return str(gset("force_join_message","") or "").strip()
 
-async def render_force_join(bot,chat_id,rows=None,joined=None,existing_message=None):
-    rows=channels(False) if rows is None else rows
-    joined=set() if joined is None else set(joined)
+async def render_force_join(bot,chat_id,user_id=None,rows=None,verification=None,existing_message=None):
+    """The single authoritative Force Join UI renderer."""
+    rows=channels(False) if rows is None else [r for r in rows if r[6]]
+    if user_id is None:
+        user_id=chat_id
+    if verification is None:
+        verification=await verify_required_channels(bot,user_id,rows)
+    remaining=verification.get("remaining",[])
     text=get_force_join_message()
-    kb=join_kb(rows,joined)
+    kb=join_kb(remaining,set(verification.get("joined",set())))
     photo=str(gset("welcome_photo","") or "").strip()
     photo_enabled=gset("welcome_photo_enabled","1")=="1"
 
     async def do_render(markup):
         if existing_message is not None:
             if getattr(existing_message,"photo",None):
-                return await bot.edit_message_caption(chat_id=chat_id,message_id=existing_message.message_id,caption=text or None,reply_markup=markup,parse_mode=ParseMode.HTML)
+                return await bot.edit_message_caption(
+                    chat_id=chat_id,message_id=existing_message.message_id,
+                    caption=text or None,reply_markup=markup,parse_mode=ParseMode.HTML)
             if text:
-                return await bot.edit_message_text(chat_id=chat_id,message_id=existing_message.message_id,text=text,reply_markup=markup,parse_mode=ParseMode.HTML)
-            raise TelegramError("Force Join message is empty and Telegram cannot make an existing text message truly empty")
+                return await bot.edit_message_text(
+                    chat_id=chat_id,message_id=existing_message.message_id,
+                    text=text,reply_markup=markup,parse_mode=ParseMode.HTML)
+            raise TelegramError("Cannot edit an existing text message to empty content.")
         if photo and photo_enabled:
             kwargs={"chat_id":chat_id,"photo":photo,"reply_markup":markup}
             if text: kwargs.update(caption=text,parse_mode=ParseMode.HTML)
             return await bot.send_photo(**kwargs)
         if not text:
-            raise TelegramError("Force Join requires a configured message or photo because Telegram cannot send a keyboard-only text message")
-        return await bot.send_message(chat_id=chat_id,text=text,reply_markup=markup,parse_mode=ParseMode.HTML)
+            raise TelegramError(
+                "Force Join message is empty and no photo is configured; "
+                "Telegram does not support a keyboard-only message.")
+        return await bot.send_message(
+            chat_id=chat_id,text=text,reply_markup=markup,parse_mode=ParseMode.HTML)
 
     try:
         return await do_render(kb)
     except TelegramError as e:
-        if any(token in str(e).lower() for token in ("custom emoji","icon_custom_emoji_id","custom_emoji_id")):
+        msg=str(e).lower()
+        if any(t in msg for t in ("custom emoji","icon_custom_emoji_id","custom_emoji_id")):
             logger.warning("ForceJoin custom emoji rejected; retrying without premium icons: %s",e)
             return await do_render(without_premium_markup(kb))
         raise
@@ -745,31 +843,55 @@ async def start(update,ctx):
     if not u:return
     is_new=add_user(u)
     if is_new and ctx.args: process_referral(u.id,ctx.args)
-    if user_status(u.id)=="blocked":return await update.message.reply_text("🚫 You are blocked from using this bot.")
-    if gset("maintenance_mode","0")=="1" and not is_admin(u.id):return await update.message.reply_text("🛠 Bot is under maintenance.")
-    rows=channels(False);ok,joined=await check_joined(ctx.bot,u.id)
-    if not rows or ok:
+    if user_status(u.id)=="blocked":
+        return await update.message.reply_text("🚫 You are blocked from using this bot.")
+    if gset("maintenance_mode","0")=="1" and not is_admin(u.id):
+        return await update.message.reply_text("🛠 Bot is under maintenance.")
+
+    rows=channels(False)
+    if not rows or is_admin(u.id) or gset("force_join_enabled","1")!="1":
         ctx.user_data.pop("force_join_message_id",None)
+        ctx.user_data.pop("force_join_message_photo",None)
         post=str(gset("postjoin","") or "").strip()
-        if post:return await update.message.reply_text(post,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
-        return await update.message.reply_text(" ",reply_markup=main_kb())
+        return await update.message.reply_text(post or " ",reply_markup=main_kb(),parse_mode=ParseMode.HTML)
+
+    verification=await verify_required_channels(ctx.bot,u.id,rows)
+    if verification["all_verified"]:
+        ctx.user_data.pop("force_join_message_id",None)
+        ctx.user_data.pop("force_join_message_photo",None)
+        post=str(gset("postjoin","") or "").strip()
+        return await update.message.reply_text(post or " ",reply_markup=main_kb(),parse_mode=ParseMode.HTML)
+
     old_id=ctx.user_data.get("force_join_message_id")
     if old_id:
         try:
-            await render_force_join(ctx.bot,u.id,rows,joined,existing_message=SimpleNamespace(message_id=old_id,photo=False))
+            await render_force_join(
+                ctx.bot,u.id,u.id,rows=rows,verification=verification,
+                existing_message=SimpleNamespace(
+                    message_id=old_id,
+                    photo=bool(ctx.user_data.get("force_join_message_photo",False))
+                )
+            )
             return
-        except TelegramError:ctx.user_data.pop("force_join_message_id",None)
+        except TelegramError:
+            ctx.user_data.pop("force_join_message_id",None)
     try:
-        m=await render_force_join(ctx.bot,u.id,rows,joined)
-        if m and getattr(m,"message_id",None):ctx.user_data["force_join_message_id"]=m.message_id
+        m=await render_force_join(ctx.bot,u.id,u.id,rows=rows,verification=verification)
+        if m and getattr(m,"message_id",None):
+            ctx.user_data["force_join_message_id"]=m.message_id
+            ctx.user_data["force_join_message_photo"]=bool(getattr(m,"photo",None))
     except TelegramError as e:
         logger.error("ForceJoin send failed user=%s: %s",u.id,e)
 
+
 async def cb_check(update,ctx):
     q=update.callback_query;uid=q.from_user.id
-    if user_status(uid)=="blocked":return await q.answer("🚫 You are blocked.",show_alert=True)
-    rows=channels(False);ok,joined=await check_joined(ctx.bot,uid)
-    if ok:
+    if user_status(uid)=="blocked":
+        return await q.answer("🚫 You are blocked.",show_alert=True)
+
+    rows=channels(False)
+    verification=await verify_required_channels(ctx.bot,uid,rows)
+    if verification["all_verified"]:
         await q.answer("✅ Verified")
         ctx.user_data.pop("force_join_message_id",None)
         post=str(gset("postjoin","") or "").strip();visible=post or " "
@@ -781,9 +903,13 @@ async def cb_check(update,ctx):
         except TelegramError:
             await ctx.bot.send_message(q.message.chat_id,visible,reply_markup=main_kb(),parse_mode=ParseMode.HTML)
         return
-    await q.answer("Please join all required channels and press Joined again.",show_alert=True)
+
+    await q.answer("Please join the remaining required channel(s) and press Joined again.",show_alert=True)
     try:
-        await render_force_join(ctx.bot,q.message.chat_id,rows,joined,existing_message=q.message)
+        await render_force_join(ctx.bot,q.message.chat_id,uid,rows=rows,
+                                verification=verification,existing_message=q.message)
+        ctx.user_data["force_join_message_id"]=q.message.message_id
+        ctx.user_data["force_join_message_photo"]=bool(getattr(q.message,"photo",None))
     except TelegramError as e:
         logger.warning("ForceJoin re-render failed user=%s: %s",uid,e)
 
@@ -972,6 +1098,7 @@ def migrate_database_file(path):
         CREATE TABLE IF NOT EXISTS referrals(referral_id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER UNIQUE NOT NULL,referrer_id INTEGER NOT NULL,created_at TEXT NOT NULL);
         """)
         migrate_force_join_message_setting(c)
+        migrate_force_join_legacy_state(c)
         for table,required in {
             "users":("username","status"),
             "channels":("enabled",),
