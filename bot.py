@@ -4,7 +4,7 @@ try:
 except ImportError:
     fcntl = None
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -45,7 +45,8 @@ logger = logging.getLogger("force_join_bot")
 
 # Conversation states
 (S_CH_ID,S_CH_NAME,S_CH_LINK,S_WELCOME,S_WELCOME_PHOTO,S_POSTJOIN,S_TOP,S_BTN1,S_BTN2,S_BTN3,
- S_BCAST,S_RESTORE,S_SEARCH,S_USERMSG,S_EDITNAME,S_EDITLINK,S_EMOJI,S_BTN_NAME,S_BTN_NORMAL,S_BTN_PREMIUM,S_FORCE_JOIN_MSG)=range(21)
+ S_BCAST,S_RESTORE,S_SEARCH,S_USERMSG,S_EDITNAME,S_EDITLINK,S_EMOJI,S_BTN_NAME,S_BTN_NORMAL,S_BTN_PREMIUM,S_FORCE_JOIN_MSG,
+ S_BCAST_BTN_ASK,S_BCAST_BTN_LINK,S_BCAST_BTN_NAME,S_BCAST_BTN_STYLE,S_BCAST_PREVIEW)=range(26)
 
 @contextmanager
 def db():
@@ -194,10 +195,14 @@ def init_db():
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
         CREATE TABLE IF NOT EXISTS join_requests(user_id INTEGER NOT NULL,channel_id TEXT NOT NULL,requested_at TEXT,status TEXT DEFAULT 'active',PRIMARY KEY(user_id,channel_id));
         CREATE TABLE IF NOT EXISTS broadcast_msgs(bcast_id TEXT NOT NULL,user_id INTEGER NOT NULL,message_id INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS broadcasts(bcast_id TEXT PRIMARY KEY,created_at TEXT,source_chat_id INTEGER,source_message_id INTEGER,kind TEXT,total INTEGER DEFAULT 0,sent INTEGER DEFAULT 0,failed INTEGER DEFAULT 0,cancelled INTEGER DEFAULT 0,status TEXT DEFAULT 'running',last_error TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS broadcasts(bcast_id TEXT PRIMARY KEY,created_at TEXT,source_chat_id INTEGER,source_message_id INTEGER,kind TEXT,total INTEGER DEFAULT 0,sent INTEGER DEFAULT 0,failed INTEGER DEFAULT 0,cancelled INTEGER DEFAULT 0,status TEXT DEFAULT 'running',last_error TEXT DEFAULT '',button_url TEXT DEFAULT '',button_label TEXT DEFAULT '',button_style TEXT DEFAULT '');
         CREATE TABLE IF NOT EXISTS error_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,created_at TEXT,level TEXT,message TEXT);
         CREATE TABLE IF NOT EXISTS referrals(referral_id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER UNIQUE NOT NULL,referrer_id INTEGER NOT NULL,created_at TEXT NOT NULL);
         """)
+        cols={r[1] for r in c.execute("PRAGMA table_info(broadcasts)")}
+        if "button_url" not in cols: c.execute("ALTER TABLE broadcasts ADD COLUMN button_url TEXT DEFAULT ''")
+        if "button_label" not in cols: c.execute("ALTER TABLE broadcasts ADD COLUMN button_label TEXT DEFAULT ''")
+        if "button_style" not in cols: c.execute("ALTER TABLE broadcasts ADD COLUMN button_style TEXT DEFAULT ''")
         # Migrate original schema safely.
         cols={r[1] for r in c.execute("PRAGMA table_info(users)")}
         if "username" not in cols: c.execute("ALTER TABLE users ADD COLUMN username TEXT DEFAULT ''")
@@ -799,8 +804,7 @@ async def render_force_join(bot,chat_id,user_id=None,rows=None,verification=None
     rows=channels(False) if rows is None else [r for r in rows if r[6]]
     if user_id is None:
         user_id=chat_id
-    if verification is None:
-        verification=await verify_required_channels(bot,user_id,rows)
+    verification=await verify_required_channels(bot,user_id,rows)
     remaining=verification.get("remaining",[])
     text=get_force_join_message()
     kb=join_kb(remaining,set(verification.get("joined",set())))
@@ -833,9 +837,20 @@ async def render_force_join(bot,chat_id,user_id=None,rows=None,verification=None
         return await do_render(kb)
     except TelegramError as e:
         msg=str(e).lower()
+        if "message is not modified" in msg or "message not modified" in msg:
+            logger.info("ForceJoin render unchanged user=%s",user_id)
+            return existing_message
         if any(t in msg for t in ("custom emoji","icon_custom_emoji_id","custom_emoji_id")):
             logger.warning("ForceJoin custom emoji rejected; retrying without premium icons: %s",e)
-            return await do_render(without_premium_markup(kb))
+            try:return await do_render(without_premium_markup(kb))
+            except TelegramError as e2:
+                if existing_message is not None:
+                    logger.warning("ForceJoin edit failed after custom emoji fallback; sending fresh UI user=%s: %s",user_id,e2)
+                    return await render_force_join(bot,chat_id,user_id,rows=rows,verification=verification,existing_message=None)
+                raise
+        if existing_message is not None:
+            logger.warning("ForceJoin existing message render failed; sending fresh UI user=%s: %s",user_id,e)
+            return await render_force_join(bot,chat_id,user_id,rows=rows,verification=verification,existing_message=None)
         raise
 
 async def start(update,ctx):
@@ -1116,7 +1131,7 @@ def migrate_database_file(path):
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT);
         CREATE TABLE IF NOT EXISTS join_requests(user_id INTEGER NOT NULL,channel_id TEXT NOT NULL,requested_at TEXT,status TEXT DEFAULT 'active',PRIMARY KEY(user_id,channel_id));
         CREATE TABLE IF NOT EXISTS broadcast_msgs(bcast_id TEXT NOT NULL,user_id INTEGER NOT NULL,message_id INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS broadcasts(bcast_id TEXT PRIMARY KEY,created_at TEXT,source_chat_id INTEGER,source_message_id INTEGER,kind TEXT,total INTEGER DEFAULT 0,sent INTEGER DEFAULT 0,failed INTEGER DEFAULT 0,cancelled INTEGER DEFAULT 0,status TEXT DEFAULT 'running',last_error TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS broadcasts(bcast_id TEXT PRIMARY KEY,created_at TEXT,source_chat_id INTEGER,source_message_id INTEGER,kind TEXT,total INTEGER DEFAULT 0,sent INTEGER DEFAULT 0,failed INTEGER DEFAULT 0,cancelled INTEGER DEFAULT 0,status TEXT DEFAULT 'running',last_error TEXT DEFAULT '',button_url TEXT DEFAULT '',button_label TEXT DEFAULT '',button_style TEXT DEFAULT '');
         CREATE TABLE IF NOT EXISTS error_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,created_at TEXT,level TEXT,message TEXT);
         CREATE TABLE IF NOT EXISTS referrals(referral_id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER UNIQUE NOT NULL,referrer_id INTEGER NOT NULL,created_at TEXT NOT NULL);
         """)
@@ -1282,8 +1297,11 @@ def cleanup_backups():
 
 def bcast_create(chat,mid,kind,total):
     bid=uuid.uuid4().hex[:16]
-    with db() as c:c.execute("INSERT INTO broadcasts VALUES(?,?,?,?,?,?,?,?,?,?,?)",(bid,datetime.now().isoformat(),chat,mid,kind,total,0,0,0,"running",""))
+    with db() as c:c.execute("INSERT INTO broadcasts(bcast_id,created_at,source_chat_id,source_message_id,kind,total,sent,failed,cancelled,status,last_error,button_url,button_label,button_style) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(bid,datetime.now().isoformat(),chat,mid,kind,total,0,0,0,"running","","","",""))
     return bid
+
+def bcast_set_button(bid,url="",label="",style=""):
+    with db() as c:c.execute("UPDATE broadcasts SET button_url=?,button_label=?,button_style=? WHERE bcast_id=?",(str(url or ""),str(label or ""),str(style or ""),bid))
 def bcast_update(bid,sent,failed,cancelled,status,err=""):
     with db() as c:c.execute("UPDATE broadcasts SET sent=?,failed=?,cancelled=?,status=?,last_error=? WHERE bcast_id=?",(sent,failed,int(cancelled),status,str(err)[:2000],bid))
 def bcast_save(bid,uid,mid):
@@ -1296,10 +1314,15 @@ async def run_broadcast(bot,admin_chat,msg,bid,recipient_list,status_msg):
     for i,uid in enumerate(recipient_list,1):
         if asyncio.current_task().cancelled():cancelled=True;break
         try:
-            m=await bot.copy_message(uid,msg.chat_id,msg.message_id);bcast_save(bid,uid,m.message_id);sent+=1
+            kwargs={"chat_id":uid,"from_chat_id":msg.chat_id,"message_id":msg.message_id}
+            if getattr(msg,"reply_markup",None) is not None: kwargs["reply_markup"]=msg.reply_markup
+            m=await bot.copy_message(**kwargs);bcast_save(bid,uid,m.message_id);sent+=1
         except RetryAfter as e:
             await asyncio.sleep(float(e.retry_after)+.5)
-            try:m=await bot.copy_message(uid,msg.chat_id,msg.message_id);bcast_save(bid,uid,m.message_id);sent+=1
+            try:
+                kwargs={"chat_id":uid,"from_chat_id":msg.chat_id,"message_id":msg.message_id}
+                if getattr(msg,"reply_markup",None) is not None: kwargs["reply_markup"]=msg.reply_markup
+                m=await bot.copy_message(**kwargs);bcast_save(bid,uid,m.message_id);sent+=1
             except Exception:failed+=1
         except Forbidden:
             failed+=1;set_status(uid,"inactive")
@@ -1313,17 +1336,114 @@ async def run_broadcast(bot,admin_chat,msg,bid,recipient_list,status_msg):
     try:await status_msg.edit_text(f"{'⏹' if cancelled else '✅'} <b>Broadcast {status.title()}</b>\n\n📤 Total: <b>{len(recipient_list)}</b>\n✅ Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>",reply_markup=kb,parse_mode=ParseMode.HTML)
     except TelegramError:pass
 
-async def start_bcast(update,ctx):
+async def _bcast_send_without_button(update,ctx,msg):
     global BROADCAST_TASK
+    us=users();bid=bcast_create(msg.chat_id,msg.message_id,"photo" if msg.photo else "video" if msg.video else "text",len(us))
+    sm=await update.effective_chat.send_message(f"⏳ Starting broadcast to <b>{len(us)}</b> recipients...",parse_mode=ParseMode.HTML)
+    async def runner():
+        async with BROADCAST_LOCK:await run_broadcast(ctx.bot,update.effective_chat.id,msg,bid,us,sm)
+    BROADCAST_TASK=asyncio.create_task(runner())
+
+async def start_bcast(update,ctx):
     if not is_admin(update.effective_user.id):return ConversationHandler.END
     if gset("broadcast_enabled","1")!="1":await update.message.reply_text("🚫 Broadcast is disabled.");return ConversationHandler.END
     if BROADCAST_LOCK.locked():await update.message.reply_text("⚠️ Another broadcast is already running.");return ConversationHandler.END
     if not (update.message.text or update.message.photo or update.message.video):await update.message.reply_text("❌ Supported: Text, Photo, Video.");return S_BCAST
-    us=users();bid=bcast_create(update.message.chat_id,update.message.message_id,"photo" if update.message.photo else "video" if update.message.video else "text",len(us))
-    sm=await update.message.reply_text(f"⏳ Starting broadcast to <b>{len(us)}</b> recipients...",parse_mode=ParseMode.HTML)
+    ctx.user_data["bcast_source_chat_id"]=update.message.chat_id
+    ctx.user_data["bcast_source_message_id"]=update.message.message_id
+    ctx.user_data["bcast_source_message"]=update.message
+    await update.message.reply_text("Do you want to add an inline button to this broadcast?",reply_markup=safe_markup([[ib("✅ Yes, add a button","bcast_btn_yes",style="success",emoji_id=EMOJI["✅"]),ib("⏭ Skip (send without button)","bcast_btn_skip",style="primary",emoji_id=EMOJI["📌"])],[ib("❌ Cancel Broadcast","bcast_btn_cancel",style="danger",emoji_id=EMOJI["❌"])]]))
+    return S_BCAST_BTN_ASK
+
+async def bcast_btn_ask(update,ctx):
+    q=update.callback_query
+    await q.answer()
+    msg=ctx.user_data.get("bcast_source_message")
+    if not msg:return ConversationHandler.END
+    if q.data=="bcast_btn_cancel":
+        ctx.user_data.clear();await q.edit_message_text("❌ Cancelled.");return ConversationHandler.END
+    if q.data=="bcast_btn_skip":
+        await _bcast_send_without_button(update,ctx,msg)
+        ctx.user_data.clear()
+        return ConversationHandler.END
+    if q.data=="bcast_btn_yes":
+        await q.edit_message_text("Send the button LINK (URL).\n\nUse an http(s) URL or t.me/... Telegram link.\n\nSend /cancel to cancel.")
+        return S_BCAST_BTN_LINK
+    return S_BCAST_BTN_ASK
+
+def _valid_bcast_url(value):
+    v=str(value or "").strip()
+    candidate=v if v.lower().startswith(("http://","https://")) else ("https://"+v if v.lower().startswith("t.me/") else "")
+    if not candidate:return None
+    try:
+        p=urlparse(candidate)
+        if p.scheme not in ("http","https") or not p.netloc:return None
+        host=p.netloc.split(":",1)[0].lower()
+        if v.lower().startswith("t.me/") and host!="t.me":return None
+        if not v.lower().startswith("t.me/") and p.scheme not in ("http","https"):return None
+        return candidate
+    except Exception:return None
+
+async def bcast_btn_link(update,ctx):
+    if not update.message or not update.message.text:return S_BCAST_BTN_LINK
+    url=_valid_bcast_url(update.message.text)
+    if not url:
+        await update.message.reply_text("❌ Invalid link. Send a valid http(s) URL or t.me/... Telegram link, or /cancel.")
+        return S_BCAST_BTN_LINK
+    ctx.user_data["bcast_button_url"]=url
+    await update.message.reply_text("Send the button NAME/label.\n\nSend /cancel to cancel.")
+    return S_BCAST_BTN_NAME
+
+async def bcast_btn_name(update,ctx):
+    if not update.message or not update.message.text:return S_BCAST_BTN_NAME
+    label=safe_button_text(update.message.text)
+    if not label or len(label)>64:
+        await update.message.reply_text("❌ Invalid button name. Send visible text up to 64 characters, or /cancel.")
+        return S_BCAST_BTN_NAME
+    ctx.user_data["bcast_button_label"]=label
+    await update.message.reply_text("Choose the button color/style.",reply_markup=safe_markup([[ib("🔵 Primary","bcast_style_primary",style="primary"),ib("🟢 Success","bcast_style_success",style="success")],[ib("🔴 Danger","bcast_style_danger",style="danger")],[ib("❌ Cancel","bcast_btn_cancel",style="danger",emoji_id=EMOJI["❌"])]]))
+    return S_BCAST_BTN_STYLE
+
+async def bcast_btn_style(update,ctx):
+    q=update.callback_query;await q.answer()
+    if q.data=="bcast_btn_cancel":
+        ctx.user_data.clear();await q.edit_message_text("❌ Cancelled.");return ConversationHandler.END
+    if not q.data.startswith("bcast_style_"):return S_BCAST_BTN_STYLE
+    style=q.data[len("bcast_style_"):]
+    if style not in BUTTON_STYLES:return S_BCAST_BTN_STYLE
+    ctx.user_data["bcast_button_style"]=style
+    msg=ctx.user_data.get("bcast_source_message")
+    url=ctx.user_data.get("bcast_button_url","");label=ctx.user_data.get("bcast_button_label","")
+    button=ib(label,url=url,style=style)
+    if not msg or not button:
+        await q.edit_message_text("❌ Unable to build the button. Send /cancel to abort.")
+        return S_BCAST_BTN_STYLE
+    preview=await ctx.bot.copy_message(q.message.chat_id,msg.chat_id,msg.message_id,reply_markup=safe_markup([[button]]))
+    ctx.user_data["bcast_preview_message_id"]=preview.message_id
+    await q.edit_message_text("<b>Preview ready.</b>\n\nConfirm to send this broadcast.",reply_markup=safe_markup([[ib("📤 Send Broadcast Now","bcast_confirm",style="success",emoji_id=EMOJI["📣"])],[ib("❌ Cancel Broadcast","bcast_cancel",style="danger",emoji_id=EMOJI["❌"])]]),parse_mode=ParseMode.HTML)
+    return S_BCAST_PREVIEW
+
+async def bcast_preview(update,ctx):
+    q=update.callback_query;await q.answer()
+    if q.data=="bcast_cancel":
+        ctx.user_data.clear();await q.edit_message_text("❌ Cancelled.");return ConversationHandler.END
+    if q.data!="bcast_confirm":return S_BCAST_PREVIEW
+    if BROADCAST_LOCK.locked():
+        await q.answer("Another broadcast is already running.",show_alert=True);return S_BCAST_PREVIEW
+    msg=ctx.user_data.get("bcast_source_message")
+    url=ctx.user_data.get("bcast_button_url","");label=ctx.user_data.get("bcast_button_label","");style=ctx.user_data.get("bcast_button_style","")
+    if not msg or style not in BUTTON_STYLES or not _valid_bcast_url(url) or not label:
+        await q.answer("Broadcast setup is incomplete.",show_alert=True);return S_BCAST_PREVIEW
+    us=users();bid=bcast_create(msg.chat_id,msg.message_id,"photo" if msg.photo else "video" if msg.video else "text",len(us));bcast_set_button(bid,url,label,style)
+    button=ib(label,url=url,style=style)
+    send_msg=SimpleNamespace(chat_id=msg.chat_id,message_id=msg.message_id,reply_markup=safe_markup([[button]]))
+    sm=await q.message.reply_text(f"⏳ Starting broadcast to <b>{len(us)}</b> recipients...",parse_mode=ParseMode.HTML)
+    global BROADCAST_TASK
     async def runner():
-        async with BROADCAST_LOCK:await run_broadcast(ctx.bot,update.effective_chat.id,update.message,bid,us,sm)
-    BROADCAST_TASK=asyncio.create_task(runner());return ConversationHandler.END
+        async with BROADCAST_LOCK:await run_broadcast(ctx.bot,q.message.chat_id,send_msg,bid,us,sm)
+    BROADCAST_TASK=asyncio.create_task(runner())
+    ctx.user_data.clear()
+    return ConversationHandler.END
 
 async def cancel_bcast(q,bid):
     global BROADCAST_TASK
@@ -1779,7 +1899,7 @@ async def admin_cb(update,ctx):
             await q.answer("Another broadcast is already running.",show_alert=True)
             return ConversationHandler.END
         with db() as c:
-            row=c.execute("SELECT source_chat_id,source_message_id FROM broadcasts WHERE bcast_id=?",(bid,)).fetchone()
+            row=c.execute("SELECT source_chat_id,source_message_id,button_url,button_label,button_style FROM broadcasts WHERE bcast_id=?",(bid,)).fetchone()
             sent_ids={r[0] for r in c.execute("SELECT user_id FROM broadcast_msgs WHERE bcast_id=?",(bid,)).fetchall()}
         if not row:
             await q.answer("Broadcast not found.",show_alert=True);return ConversationHandler.END
@@ -1787,7 +1907,10 @@ async def admin_cb(update,ctx):
         if not failed_ids:
             await q.answer("No failed recipients found.",show_alert=True);return ConversationHandler.END
         source=SimpleNamespace(chat_id=row[0],message_id=row[1])
+        if row[2] and row[3] and row[4] in BUTTON_STYLES:
+            source.reply_markup=safe_markup([[ib(row[3],url=row[2],style=row[4])]])
         retry_id=bcast_create(row[0],row[1],"retry",len(failed_ids))
+        if row[2] and row[3] and row[4] in BUTTON_STYLES:bcast_set_button(retry_id,row[2],row[3],row[4])
         status_msg=await q.message.reply_text(f"🔁 Retrying <b>{len(failed_ids)}</b> failed recipients...",parse_mode=ParseMode.HTML)
         async def retry_runner():
             async with BROADCAST_LOCK:
@@ -1886,9 +2009,25 @@ async def auto_backup_loop():
         except asyncio.CancelledError:return
         except Exception as e:logger.exception("Auto backup: %s",e)
 
+async def _check_force_join_admin_rights(bot):
+    rows=channels(False)
+    if not rows:return
+    try:me=await bot.get_me()
+    except TelegramError as e:
+        logger.warning("ForceJoin channel admin check failed: %s",e);return
+    for r in rows:
+        cid=str(r[1]).strip()
+        try:
+            m=await bot.get_chat_member(cid,me.id)
+            status=str(getattr(m,"status","") or "").lower()
+            if status not in ("administrator","creator"):
+                logger.warning("ForceJoin required channel %s (%s) does not grant the bot admin rights (status=%s). Telegram chat_member updates may not be delivered.",cid,r[2],status)
+        except TelegramError as e:
+            logger.warning("ForceJoin required channel %s (%s) admin-right check failed: %s",cid,r[2],e)
+
 async def post_init(app):
     global AUTO_BACKUP_TASK
-    init_db();AUTO_BACKUP_TASK=asyncio.create_task(auto_backup_loop())
+    init_db();await _check_force_join_admin_rights(app.bot);AUTO_BACKUP_TASK=asyncio.create_task(auto_backup_loop())
 async def post_shutdown(app):
     global AUTO_BACKUP_TASK,BROADCAST_TASK
     for t in (AUTO_BACKUP_TASK,BROADCAST_TASK):
@@ -2028,7 +2167,7 @@ def main():
         S_CH_ID:[MessageHandler(tf,s_ch_id)],S_CH_NAME:[MessageHandler(tf,s_ch_name)],S_CH_LINK:[MessageHandler(tf,s_ch_link)],
         S_WELCOME:[MessageHandler(tf,s_welcome)],S_WELCOME_PHOTO:[MessageHandler((filters.PHOTO|filters.TEXT)&~filters.COMMAND,s_photo)],
         S_POSTJOIN:[MessageHandler(tf,s_postjoin)],S_TOP:[MessageHandler(tf,s_top)],S_BTN1:[MessageHandler(tf,s_btn1)],S_BTN2:[MessageHandler(tf,s_btn2)],S_BTN3:[MessageHandler(tf,s_btn3)],
-        S_BCAST:[MessageHandler(bf,start_bcast)],S_RESTORE:[MessageHandler(rf,s_restore)],S_SEARCH:[MessageHandler(tf,s_search)],S_USERMSG:[MessageHandler(bf,s_usermsg)],
+        S_BCAST:[MessageHandler(bf,start_bcast)],S_BCAST_BTN_ASK:[CallbackQueryHandler(bcast_btn_ask,pattern=r"^bcast_btn_(yes|skip|cancel)$")],S_BCAST_BTN_LINK:[MessageHandler(tf,bcast_btn_link)],S_BCAST_BTN_NAME:[MessageHandler(tf,bcast_btn_name)],S_BCAST_BTN_STYLE:[CallbackQueryHandler(bcast_btn_style,pattern=r"^(bcast_style_|bcast_btn_cancel)")],S_BCAST_PREVIEW:[CallbackQueryHandler(bcast_preview,pattern=r"^bcast_(confirm|cancel)$")],S_RESTORE:[MessageHandler(rf,s_restore)],S_SEARCH:[MessageHandler(tf,s_search)],S_USERMSG:[MessageHandler(bf,s_usermsg)],
         S_EDITNAME:[MessageHandler(tf,s_editname)],S_EDITLINK:[MessageHandler(tf,s_editlink)],S_EMOJI:[MessageHandler(tf,s_emoji)],S_BTN_NAME:[MessageHandler(tf,s_button_name)],S_BTN_NORMAL:[MessageHandler(tf,s_button_normal)],S_BTN_PREMIUM:[MessageHandler(tf,s_button_premium)],S_FORCE_JOIN_MSG:[MessageHandler(tf,s_force_join_message)]
       },fallbacks=[CommandHandler("cancel",cancel),CallbackQueryHandler(admin_cb,pattern=r"^a_")],per_chat=False,per_user=True,allow_reentry=True)
     app.add_handler(CommandHandler("start",start));app.add_handler(conv)
