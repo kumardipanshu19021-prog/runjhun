@@ -52,7 +52,7 @@ logger = logging.getLogger("force_join_bot")
 def db():
     c=sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     try:
-        c.execute("PRAGMA busy_timeout=30000"); c.execute("PRAGMA journal_mode=WAL"); c.execute("PRAGMA synchronous=NORMAL")
+        c.execute("PRAGMA busy_timeout=30000"); c.execute("PRAGMA synchronous=NORMAL")
         yield c; c.commit()
     except Exception:
         c.rollback(); raise
@@ -189,6 +189,7 @@ def migrate_force_join_legacy_state(conn):
 
 def init_db():
     with db() as c:
+        c.execute("PRAGMA journal_mode=WAL")
         c.executescript("""
         CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY,first_name TEXT DEFAULT '',username TEXT DEFAULT '',joined_at TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active');
         CREATE TABLE IF NOT EXISTS channels(id INTEGER PRIMARY KEY AUTOINCREMENT,channel_id TEXT UNIQUE NOT NULL,channel_name TEXT NOT NULL,channel_link TEXT NOT NULL,position INTEGER DEFAULT 0,order_num INTEGER DEFAULT 0,enabled INTEGER NOT NULL DEFAULT 1);
@@ -334,9 +335,12 @@ def get_request_status(uid,cid):
 async def verify_channel_membership(bot,user_id,channel_id):
     cid=str(channel_id).strip()
     result={"state":"unknown","is_member":False,"request_pending":False,"error":None}
-    # A recorded pending join request is sufficient to pass Force Join.
-    # Do not approve it here; the user still has to press Verify.
-    if get_request_status(user_id,cid)=="pending":
+    # A recorded pending/approved join request is sufficient to pass Force Join.
+    # Telegram may still report the user as "left" until the request is approved,
+    # so the local request state must be checked before and after get_chat_member().
+    request_status=get_request_status(user_id,cid)
+    request_is_pending=request_status in ("pending","approved")
+    if request_is_pending:
         result.update(state="pending",request_pending=True,is_member=True)
         return result
     try:
@@ -345,19 +349,27 @@ async def verify_channel_membership(bot,user_id,channel_id):
         if status in ("member","administrator","creator", "restricted"):
             result.update(state=status,is_member=True)
         elif status=="left":
-            result["state"]="left"
+            # A pending join request can legitimately appear as "left" in
+            # get_chat_member(), so never let that override recorded request state.
+            if get_request_status(user_id,cid) in ("pending","approved"):
+                result.update(state="pending",request_pending=True,is_member=True)
+            else:
+                result["state"]="left"
         elif status in ("kicked","banned"):
             result["state"]="kicked"
         elif status in ("pending","join_request"):
             # Compatibility with API variants that expose a pending state.
             result.update(state="pending",request_pending=True,is_member=True)
         else:
-            result["state"]="unknown"
+            if get_request_status(user_id,cid) in ("pending","approved"):
+                result.update(state="pending",request_pending=True,is_member=True)
+            else:
+                result["state"]="unknown"
         return result
     except Exception as e:
         # If Telegram cannot return membership details, a locally recorded
-        # pending request is still enough to let the user press Verify.
-        if get_request_status(user_id,cid)=="pending":
+        # pending/approved request is still enough to let the user press Verify.
+        if get_request_status(user_id,cid) in ("pending","approved"):
             result.update(state="pending",request_pending=True,is_member=True,error=None)
             return result
         result.update(state="api_error",error=str(e))
@@ -367,24 +379,44 @@ async def verify_channel_membership(bot,user_id,channel_id):
 async def verify_required_channels(bot,user_id,rows=None):
     """Check every enabled required channel exactly once per verification cycle."""
     rows=channels(False) if rows is None else [r for r in rows if r[6]]
-    joined=set();remaining=[];results=[];all_verified=True
-    for r in rows:
+    joined=set();remaining=[];results=[None]*len(rows);all_verified=True;valid_rows=[]
+    for index,r in enumerate(rows):
         cid=str(r[1]).strip()
         if not cid:
-            all_verified=False
-            remaining.append(r)
-            results.append({"channel":r,"channel_id":cid,"state":"unknown",
-                            "is_member":False,"request_pending":False,"error":"empty channel id"})
+            results[index]={"channel":r,"channel_id":cid,"state":"unknown",
+                            "is_member":False,"request_pending":False,"error":"empty channel id"}
             continue
-        result=await verify_channel_membership(bot,user_id,cid)
-        result["channel"]=r
-        results.append(result)
+        valid_rows.append((index,r,cid))
+
+    if valid_rows:
+        checks=await asyncio.gather(
+            *(verify_channel_membership(bot,user_id,cid) for index,r,cid in valid_rows),
+            return_exceptions=True,
+        )
+        for (index,r,cid),result in zip(valid_rows,checks):
+            if isinstance(result,Exception):
+                result={"state":"api_error","is_member":False,"request_pending":False,"error":str(result)}
+            result["channel"]=r
+            results[index]=result
+
+    verified_ids=[]
+    for r,result in zip(rows,results):
+        if result is None:
+            result={"channel":r,"channel_id":str(r[1]).strip(),"state":"unknown",
+                    "is_member":False,"request_pending":False,"error":"verification unavailable"}
         if result["is_member"]:
-            joined.add(cid)
-            mark_req(user_id,cid)
+            joined.add(str(r[1]).strip())
+            verified_ids.append(str(r[1]).strip())
         else:
             all_verified=False
             remaining.append(r)
+    if verified_ids:
+        with db() as c:
+            c.executemany(
+                "UPDATE join_requests SET status='verified' WHERE user_id=? AND channel_id=?",
+                ((user_id,cid) for cid in verified_ids)
+            )
+
     logger.info("ForceJoin verification cycle user=%s all_verified=%s remaining_channels=%s",
                 user_id,all_verified,[str(r[1]) for r in remaining])
     return {"all_verified":all_verified,"joined":joined,"remaining":remaining,"results":results}
@@ -801,9 +833,19 @@ async def render_force_join(bot,chat_id,user_id=None,rows=None,verification=None
     rows=channels(False) if rows is None else [r for r in rows if r[6]]
     if user_id is None:
         user_id=chat_id
-    verification=await verify_required_channels(bot,user_id,rows)
+    if verification is None:
+        verification=await verify_required_channels(bot,user_id,rows)
     remaining=verification.get("remaining",[])
     text=get_force_join_message()
+    # Telegram cannot send a text-only message with an inline keyboard when the
+    # Force Join message is empty. Use a safe built-in fallback instead of
+    # raising an error after an admin adds the first required channel.
+    if not text:
+        text=(
+            "🔒 <b>Join Required</b>\n\n"
+            "Please join the required channel(s) below and then press "
+            "<b>Joined</b> to continue."
+        )
     kb=join_kb(remaining,set(verification.get("joined",set())))
     # Keep the configured Welcome Photo on the initial Force Join screen.
     # It is removed only when verification succeeds and the main menu opens.
@@ -825,7 +867,32 @@ async def render_force_join(bot,chat_id,user_id=None,rows=None,verification=None
             kwargs={"chat_id":chat_id,"photo":photo,"reply_markup":markup}
             if text:
                 kwargs.update(caption=text,parse_mode=ParseMode.HTML)
-            return await bot.send_photo(**kwargs)
+            try:
+                return await bot.send_photo(**kwargs)
+            except TelegramError as e:
+                # Never let a bad/expired photo ID, inaccessible URL, or another
+                # Telegram photo error make /start appear completely unresponsive.
+                err=str(e).lower()
+                logger.warning("ForceJoin photo send failed; falling back to text UI: %s", e)
+                if "wrong file identifier/http url specified" in err or "wrong file identifier" in err or "http url" in err:
+                    try:
+                        sset("welcome_photo","")
+                    except Exception:
+                        pass
+                try:
+                    return await bot.send_message(
+                        chat_id=chat_id,
+                        text=text or "Join the required channel(s) and press Joined.",
+                        reply_markup=markup,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except TelegramError:
+                    # Last-resort delivery: plain text, still with the same buttons.
+                    return await bot.send_message(
+                        chat_id=chat_id,
+                        text="Join the required channel(s) and press Joined.",
+                        reply_markup=markup,
+                    )
         if not text:
             raise TelegramError(
                 "Force Join message is empty; Telegram does not support a keyboard-only message.")
@@ -897,6 +964,25 @@ async def start(update,ctx):
             ctx.user_data["force_join_message_photo"]=bool(getattr(m,"photo",None))
     except TelegramError as e:
         logger.error("ForceJoin send failed user=%s: %s",u.id,e)
+        # Ensure /start always produces a visible response even when the
+        # configured image/caption fails unexpectedly.
+        try:
+            fallback_text=get_force_join_message() or "Join the required channel(s) and press Joined."
+            await ctx.bot.send_message(
+                chat_id=u.id,
+                text=fallback_text,
+                reply_markup=join_kb(verification.get("remaining",[]), set(verification.get("joined",set()))),
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            try:
+                await ctx.bot.send_message(
+                    chat_id=u.id,
+                    text="Join the required channel(s) and press Joined.",
+                    reply_markup=join_kb(verification.get("remaining",[]), set(verification.get("joined",set()))),
+                )
+            except TelegramError:
+                pass
 
 
 async def cb_check(update,ctx):
