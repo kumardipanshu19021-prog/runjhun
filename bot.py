@@ -339,7 +339,7 @@ async def verify_channel_membership(bot,user_id,channel_id):
     # Telegram may still report the user as "left" until the request is approved,
     # so the local request state must be checked before and after get_chat_member().
     request_status=get_request_status(user_id,cid)
-    request_is_pending=request_status in ("pending","approved")
+    request_is_pending=request_status in ("pending","approved","verified")
     if request_is_pending:
         result.update(state="pending",request_pending=True,is_member=True)
         return result
@@ -351,7 +351,7 @@ async def verify_channel_membership(bot,user_id,channel_id):
         elif status=="left":
             # A pending join request can legitimately appear as "left" in
             # get_chat_member(), so never let that override recorded request state.
-            if get_request_status(user_id,cid) in ("pending","approved"):
+            if get_request_status(user_id,cid) in ("pending","approved","verified"):
                 result.update(state="pending",request_pending=True,is_member=True)
             else:
                 result["state"]="left"
@@ -361,7 +361,7 @@ async def verify_channel_membership(bot,user_id,channel_id):
             # Compatibility with API variants that expose a pending state.
             result.update(state="pending",request_pending=True,is_member=True)
         else:
-            if get_request_status(user_id,cid) in ("pending","approved"):
+            if get_request_status(user_id,cid) in ("pending","approved","verified"):
                 result.update(state="pending",request_pending=True,is_member=True)
             else:
                 result["state"]="unknown"
@@ -369,7 +369,7 @@ async def verify_channel_membership(bot,user_id,channel_id):
     except Exception as e:
         # If Telegram cannot return membership details, a locally recorded
         # pending/approved request is still enough to let the user press Verify.
-        if get_request_status(user_id,cid) in ("pending","approved"):
+        if get_request_status(user_id,cid) in ("pending","approved","verified"):
             result.update(state="pending",request_pending=True,is_member=True,error=None)
             return result
         result.update(state="api_error",error=str(e))
@@ -944,19 +944,6 @@ async def start(update,ctx):
         post=str(gset("postjoin","") or "").strip()
         return await update.message.reply_text(post or " ",reply_markup=main_kb(),parse_mode=ParseMode.HTML)
 
-    old_id=ctx.user_data.get("force_join_message_id")
-    if old_id:
-        try:
-            await render_force_join(
-                ctx.bot,u.id,u.id,rows=rows,verification=verification,
-                existing_message=SimpleNamespace(
-                    message_id=old_id,
-                    photo=bool(ctx.user_data.get("force_join_message_photo",False))
-                )
-            )
-            return
-        except TelegramError:
-            ctx.user_data.pop("force_join_message_id",None)
     try:
         m=await render_force_join(ctx.bot,u.id,u.id,rows=rows,verification=verification)
         if m and getattr(m,"message_id",None):
@@ -1399,27 +1386,43 @@ def bcast_rows(bid):
     with db() as c:return c.execute("SELECT user_id,message_id FROM broadcast_msgs WHERE bcast_id=?",(bid,)).fetchall()
 
 async def run_broadcast(bot,admin_chat,msg,bid,recipient_list,status_msg):
-    sent=failed=0;cancelled=False
-    for i,uid in enumerate(recipient_list,1):
-        if asyncio.current_task().cancelled():cancelled=True;break
-        try:
-            kwargs={"chat_id":uid,"from_chat_id":msg.chat_id,"message_id":msg.message_id}
-            if getattr(msg,"reply_markup",None) is not None: kwargs["reply_markup"]=msg.reply_markup
-            m=await bot.copy_message(**kwargs);bcast_save(bid,uid,m.message_id);sent+=1
-        except RetryAfter as e:
-            await asyncio.sleep(float(e.retry_after)+.5)
+    sent=failed=0;cancelled=False;total=len(recipient_list)
+    progress={"i":0};counters_lock=asyncio.Lock();CONCURRENCY=20
+    sem=asyncio.Semaphore(CONCURRENCY)
+
+    async def send_one(uid):
+        nonlocal sent,failed
+        async with sem:
             try:
                 kwargs={"chat_id":uid,"from_chat_id":msg.chat_id,"message_id":msg.message_id}
                 if getattr(msg,"reply_markup",None) is not None: kwargs["reply_markup"]=msg.reply_markup
-                m=await bot.copy_message(**kwargs);bcast_save(bid,uid,m.message_id);sent+=1
-            except Exception:failed+=1
-        except Forbidden:
-            failed+=1;set_status(uid,"inactive")
-        except TelegramError as e:failed+=1;logger.warning("Broadcast %s failed for %s: %s",bid,uid,e)
-        if i%10==0 or i==len(recipient_list):
-            try:await status_msg.edit_text(f"📣 <b>Broadcasting...</b>\n\n📤 Progress: <b>{i}/{len(recipient_list)}</b>\n✅ Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>",reply_markup=safe_markup([[ib("⏹ Cancel Broadcast",f"a_cancelbc_{bid}",style="danger",emoji_id=EMOJI["❌"])] ]),parse_mode=ParseMode.HTML)
-            except TelegramError:pass
-        await asyncio.sleep(.08)
+                m=await bot.copy_message(**kwargs);bcast_save(bid,uid,m.message_id)
+                async with counters_lock:sent+=1
+            except RetryAfter as e:
+                await asyncio.sleep(float(e.retry_after)+.5)
+                try:
+                    kwargs={"chat_id":uid,"from_chat_id":msg.chat_id,"message_id":msg.message_id}
+                    if getattr(msg,"reply_markup",None) is not None: kwargs["reply_markup"]=msg.reply_markup
+                    m=await bot.copy_message(**kwargs);bcast_save(bid,uid,m.message_id)
+                    async with counters_lock:sent+=1
+                except Exception:
+                    async with counters_lock:failed+=1
+            except Forbidden:
+                async with counters_lock:failed+=1
+                set_status(uid,"inactive")
+            except TelegramError as e:
+                async with counters_lock:failed+=1
+                logger.warning("Broadcast %s failed for %s: %s",bid,uid,e)
+            async with counters_lock:
+                progress["i"]+=1;i=progress["i"]
+            if i%10==0 or i==total:
+                try:await status_msg.edit_text(f"📣 <b>Broadcasting...</b>\n\n📤 Progress: <b>{i}/{total}</b>\n✅ Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>",reply_markup=safe_markup([[ib("⏹ Cancel Broadcast",f"a_cancelbc_{bid}",style="danger",emoji_id=EMOJI["❌"])] ]),parse_mode=ParseMode.HTML)
+                except TelegramError:pass
+
+    for chunk_start in range(0,total,CONCURRENCY):
+        if asyncio.current_task().cancelled():cancelled=True;break
+        chunk=recipient_list[chunk_start:chunk_start+CONCURRENCY]
+        await asyncio.gather(*(send_one(uid) for uid in chunk))
     status="cancelled" if cancelled else "completed";bcast_update(bid,sent,failed,cancelled,status)
     kb=safe_markup([[ib("🔁 Retry Failed",f"a_retrybc_{bid}",style="success",emoji_id=EMOJI["🌟"])],[ib("🗑 Delete Broadcast",f"a_delbc_{bid}",style="danger",emoji_id=EMOJI["❌"])],[back_button("a_bcast")]])
     try:await status_msg.edit_text(f"{'⏹' if cancelled else '✅'} <b>Broadcast {status.title()}</b>\n\n📤 Total: <b>{len(recipient_list)}</b>\n✅ Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>",reply_markup=kb,parse_mode=ParseMode.HTML)
