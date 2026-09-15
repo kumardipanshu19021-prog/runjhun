@@ -37,6 +37,19 @@ INSTANCE_LOCK_FILE = None
 INSTANCE_LOCK_FH = None
 CONFLICT_SHUTDOWN = False
 
+# Performance layer: hot SQLite/settings work is kept in-process without changing bot features.
+_DB_LOCAL = threading.local()
+_SETTINGS_CACHE = {}
+_SETTINGS_CACHE_LOCK = threading.RLock()
+SETTINGS_CACHE_TTL = float(os.getenv("SETTINGS_CACHE_TTL", "15"))
+BUTTON_CACHE = {}
+BUTTON_CACHE_TTL = float(os.getenv("BUTTON_CACHE_TTL", "15"))
+BROADCAST_CONCURRENCY = max(20, int(os.getenv("BROADCAST_CONCURRENCY", "40")))
+BROADCAST_CHUNK_SIZE = max(BROADCAST_CONCURRENCY * 4, int(os.getenv("BROADCAST_CHUNK_SIZE", "200")))
+BROADCAST_PROGRESS_EVERY = max(20, int(os.getenv("BROADCAST_PROGRESS_EVERY", "25")))
+BOT_USERNAME_CACHE = ""
+BOT_ID_CACHE = 0
+
 BTN1, BTN2, BTN3 = "🎯 Claim Agent", "📊 Statistics", "🤝 Refer & Earn"
 EMOJI = {"🎯": "5228855127892327218", "📊": "6093382540784046658", "🤝": "6086990448331592466", "📣": "6095891759462617671", "💬": "6095865895169560113", "📝": "6010292709066019210", "🖼️": "5341285075210224047", "➕": "6093406373557571574", "❌": "6010471186432005118", "⚙️": "6010355840790303830", "✅": "6246537187614005254", "🌟": "5783170625090622777", "📌": "6089019283508040459", "🔔": "6093852083788715042", "👑": "6247039939305808563", "💰": "5785325680765965100"}
 
@@ -48,15 +61,27 @@ logger = logging.getLogger("force_join_bot")
  S_BCAST,S_RESTORE,S_SEARCH,S_USERMSG,S_EDITNAME,S_EDITLINK,S_EMOJI,S_BTN_NAME,S_BTN_NORMAL,S_BTN_PREMIUM,S_FORCE_JOIN_MSG,
  S_BCAST_BTN_ASK,S_BCAST_BTN_LINK,S_BCAST_BTN_NAME,S_BCAST_BTN_STYLE,S_BCAST_PREVIEW)=range(26)
 
+def _sqlite_connection():
+    c=getattr(_DB_LOCAL,"connection",None)
+    if c is None:
+        c=sqlite3.connect(DB_PATH, timeout=10, check_same_thread=False)
+        c.execute("PRAGMA busy_timeout=10000")
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+        c.execute("PRAGMA temp_store=MEMORY")
+        c.execute("PRAGMA cache_size=-64000")
+        c.execute("PRAGMA mmap_size=268435456")
+        _DB_LOCAL.connection=c
+    return c
+
 @contextmanager
 def db():
-    c=sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    c=_sqlite_connection()
     try:
-        c.execute("PRAGMA busy_timeout=30000"); c.execute("PRAGMA synchronous=NORMAL")
-        yield c; c.commit()
+        yield c
+        c.commit()
     except Exception:
         c.rollback(); raise
-    finally: c.close()
 
 def esc(x): return html.escape(str(x or ""))
 def scalar(sql,args=(),default=0):
@@ -68,15 +93,27 @@ def scalar(sql,args=(),default=0):
         logger.error("DB scalar: %s",e); return default
 
 def gset(k,d=""):
+    now=time.monotonic()
+    with _SETTINGS_CACHE_LOCK:
+        cached=_SETTINGS_CACHE.get(k)
+        if cached and now-cached[0] < SETTINGS_CACHE_TTL:
+            return cached[1]
     try:
         with db() as c:
             r=c.execute("SELECT value FROM settings WHERE key=?",(k,)).fetchone()
-            return r[0] if r else d
+            value=r[0] if r else d
+        with _SETTINGS_CACHE_LOCK:
+            _SETTINGS_CACHE[k]=(now,value)
+        return value
     except Exception as e:
         logger.error("gset %s: %s",k,e); return d
 
 def sset(k,v):
-    with db() as c: c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",(k,str(v)))
+    value=str(v)
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",(k,value))
+    with _SETTINGS_CACHE_LOCK:
+        _SETTINGS_CACHE[k]=(time.monotonic(),value)
 
 def log_error(level,msg):
     global LAST_ERROR
@@ -190,6 +227,10 @@ def migrate_force_join_legacy_state(conn):
 def init_db():
     with db() as c:
         c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+        c.execute("PRAGMA temp_store=MEMORY")
+        c.execute("PRAGMA cache_size=-64000")
+        c.execute("PRAGMA mmap_size=268435456")
         c.executescript("""
         CREATE TABLE IF NOT EXISTS users(user_id INTEGER PRIMARY KEY,first_name TEXT DEFAULT '',username TEXT DEFAULT '',joined_at TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'active');
         CREATE TABLE IF NOT EXISTS channels(id INTEGER PRIMARY KEY AUTOINCREMENT,channel_id TEXT UNIQUE NOT NULL,channel_name TEXT NOT NULL,channel_link TEXT NOT NULL,position INTEGER DEFAULT 0,order_num INTEGER DEFAULT 0,enabled INTEGER NOT NULL DEFAULT 1);
@@ -332,13 +373,14 @@ def get_request_status(uid,cid):
         return None
 
 
-async def verify_channel_membership(bot,user_id,channel_id):
+async def verify_channel_membership(bot,user_id,channel_id,request_status=None):
     cid=str(channel_id).strip()
     result={"state":"unknown","is_member":False,"request_pending":False,"error":None}
     # A recorded pending/approved join request is sufficient to pass Force Join.
     # Telegram may still report the user as "left" until the request is approved,
     # so the local request state must be checked before and after get_chat_member().
-    request_status=get_request_status(user_id,cid)
+    if request_status is None:
+        request_status=get_request_status(user_id,cid)
     request_is_pending=request_status in ("pending","approved","verified")
     if request_is_pending:
         result.update(state="pending",request_pending=True,is_member=True)
@@ -351,7 +393,7 @@ async def verify_channel_membership(bot,user_id,channel_id):
         elif status=="left":
             # A pending join request can legitimately appear as "left" in
             # get_chat_member(), so never let that override recorded request state.
-            if get_request_status(user_id,cid) in ("pending","approved","verified"):
+            if request_status in ("pending","approved","verified"):
                 result.update(state="pending",request_pending=True,is_member=True)
             else:
                 result["state"]="left"
@@ -361,7 +403,7 @@ async def verify_channel_membership(bot,user_id,channel_id):
             # Compatibility with API variants that expose a pending state.
             result.update(state="pending",request_pending=True,is_member=True)
         else:
-            if get_request_status(user_id,cid) in ("pending","approved","verified"):
+            if request_status in ("pending","approved","verified"):
                 result.update(state="pending",request_pending=True,is_member=True)
             else:
                 result["state"]="unknown"
@@ -369,12 +411,27 @@ async def verify_channel_membership(bot,user_id,channel_id):
     except Exception as e:
         # If Telegram cannot return membership details, a locally recorded
         # pending/approved request is still enough to let the user press Verify.
-        if get_request_status(user_id,cid) in ("pending","approved","verified"):
+        if request_status in ("pending","approved","verified"):
             result.update(state="pending",request_pending=True,is_member=True,error=None)
             return result
         result.update(state="api_error",error=str(e))
         return result
 
+
+def _request_status_map(user_id,channel_ids):
+    ids=[str(cid).strip() for cid in channel_ids if str(cid).strip()]
+    if not ids:
+        return {}
+    marks=",".join("?" for _ in ids)
+    try:
+        with db() as c:
+            rows=c.execute(
+                f"SELECT channel_id,status FROM join_requests WHERE user_id=? AND channel_id IN ({marks})",
+                (user_id,*ids)).fetchall()
+        return {str(cid):str(status).lower() if status else None for cid,status in rows}
+    except Exception as e:
+        logger.warning("Batch join request status lookup failed user=%s: %s",user_id,e)
+        return {}
 
 async def verify_required_channels(bot,user_id,rows=None):
     """Check every enabled required channel exactly once per verification cycle."""
@@ -389,8 +446,9 @@ async def verify_required_channels(bot,user_id,rows=None):
         valid_rows.append((index,r,cid))
 
     if valid_rows:
+        status_map=_request_status_map(user_id,[cid for _,_,cid in valid_rows])
         checks=await asyncio.gather(
-            *(verify_channel_membership(bot,user_id,cid) for index,r,cid in valid_rows),
+            *(verify_channel_membership(bot,user_id,cid,status_map.get(cid)) for index,r,cid in valid_rows),
             return_exceptions=True,
         )
         for (index,r,cid),result in zip(valid_rows,checks):
@@ -531,6 +589,10 @@ def migrate_button_configs(conn=None):
 def get_button_config(key):
     default=_default_config(key)
     if not default: return None
+    now=time.monotonic()
+    cached=BUTTON_CACHE.get(key)
+    if cached and now-cached[0] < BUTTON_CACHE_TTL:
+        return dict(cached[1])
     raw=gset(BUTTON_CONFIG_PREFIX+key,"")
     cfg=_config_from_json(raw) if raw else None
     if not cfg:
@@ -541,7 +603,6 @@ def get_button_config(key):
     merged["normal_emoji"]=str(merged.get("normal_emoji",default["normal_emoji"]) or "")
     pe=str(merged.get("premium_emoji_id","") or "")
     merged["premium_emoji_id"]=pe if pe.isdigit() else ""
-    # Normal Unicode button icons are intentionally disabled.
     merged["normal_emoji"]=""
     merged["premium_enabled"]=bool(merged.get("premium_enabled",default["premium_enabled"]))
     merged["style"]=merged.get("style") if merged.get("style") in BUTTON_STYLES else default["style"]
@@ -549,8 +610,8 @@ def get_button_config(key):
     merged["enabled"]=bool(merged.get("enabled",default["enabled"]))
     merged["callback_data"]=default["callback_data"]
     merged["url"]=default.get("url")
-    return merged
-
+    BUTTON_CACHE[key]=(now,dict(merged))
+    return dict(merged)
 
 def save_button_config(key, **changes):
     cfg=get_button_config(key)
@@ -568,6 +629,9 @@ def save_button_config(key, **changes):
     cfg["position"]=max(1,int(cfg.get("position",1)))
     cfg["enabled"]=bool(cfg.get("enabled",True))
     with db() as c: c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",(BUTTON_CONFIG_PREFIX+key,_config_to_json(cfg)))
+    BUTTON_CACHE[key]=(time.monotonic(),dict(cfg))
+    with _SETTINGS_CACHE_LOCK:
+        _SETTINGS_CACHE[BUTTON_CONFIG_PREFIX+key]=(time.monotonic(),_config_to_json(cfg))
     # Keep legacy public settings in sync for old integrations/backups/admin tools.
     if key in ("btn1","btn2","btn3"):
         with db() as c:
@@ -736,13 +800,31 @@ def referral_count(uid):
 def referral_link(bot_username, uid):
     return f"https://t.me/{bot_username}?start={uid}"
 
-async def referral_text(bot, uid):
+async def get_cached_bot_username(bot):
+    global BOT_USERNAME_CACHE,BOT_ID_CACHE
+    if BOT_USERNAME_CACHE or BOT_ID_CACHE:
+        return BOT_USERNAME_CACHE
     me=await bot.get_me()
+    BOT_USERNAME_CACHE=me.username or ""
+    BOT_ID_CACHE=me.id
+    return BOT_USERNAME_CACHE
+
+async def get_cached_bot_id(bot):
+    global BOT_USERNAME_CACHE,BOT_ID_CACHE
+    if BOT_ID_CACHE:
+        return BOT_ID_CACHE
+    me=await bot.get_me()
+    BOT_USERNAME_CACHE=me.username or BOT_USERNAME_CACHE
+    BOT_ID_CACHE=me.id
+    return BOT_ID_CACHE
+
+async def referral_text(bot, uid):
+    bot_username=await get_cached_bot_username(bot)
     count=referral_count(uid)
     target=max(1,int(gset("referral_target","1") or "1"))
     reward=gset("referral_reward","1")
     needed=max(0,target-count)
-    link=referral_link(me.username or "",uid)
+    link=referral_link(bot_username,uid)
     return (
         "🤩<b>ᴍʏ ʀᴇꜰᴇʀʀᴀʟ ʟɪɴᴋ</b>\n\n"
         "━━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -763,9 +845,9 @@ def referral_kb(link):
 async def show_referral(update,ctx):
     uid=update.effective_user.id
     try:
-        me=await ctx.bot.get_me()
+        bot_username=await get_cached_bot_username(ctx.bot)
         text=await referral_text(ctx.bot,uid)
-        kb=referral_kb(referral_link(me.username or "",uid))
+        kb=referral_kb(referral_link(bot_username,uid))
         if update.callback_query:
             q=update.callback_query
             await q.edit_message_text(text,reply_markup=kb,parse_mode=ParseMode.HTML)
@@ -1387,46 +1469,79 @@ def bcast_rows(bid):
 
 async def run_broadcast(bot,admin_chat,msg,bid,recipient_list,status_msg):
     sent=failed=0;cancelled=False;total=len(recipient_list)
-    progress={"i":0};counters_lock=asyncio.Lock();CONCURRENCY=20
-    sem=asyncio.Semaphore(CONCURRENCY)
+    sem=asyncio.Semaphore(BROADCAST_CONCURRENCY)
+    progress={"i":0}
 
     async def send_one(uid):
-        nonlocal sent,failed
         async with sem:
             try:
                 kwargs={"chat_id":uid,"from_chat_id":msg.chat_id,"message_id":msg.message_id}
-                if getattr(msg,"reply_markup",None) is not None: kwargs["reply_markup"]=msg.reply_markup
-                m=await bot.copy_message(**kwargs);bcast_save(bid,uid,m.message_id)
-                async with counters_lock:sent+=1
+                if getattr(msg,"reply_markup",None) is not None:
+                    kwargs["reply_markup"]=msg.reply_markup
+                m=await bot.copy_message(**kwargs)
+                return uid,m.message_id,True
             except RetryAfter as e:
-                await asyncio.sleep(float(e.retry_after)+.5)
+                await asyncio.sleep(float(e.retry_after)+0.1)
                 try:
                     kwargs={"chat_id":uid,"from_chat_id":msg.chat_id,"message_id":msg.message_id}
-                    if getattr(msg,"reply_markup",None) is not None: kwargs["reply_markup"]=msg.reply_markup
-                    m=await bot.copy_message(**kwargs);bcast_save(bid,uid,m.message_id)
-                    async with counters_lock:sent+=1
+                    if getattr(msg,"reply_markup",None) is not None:
+                        kwargs["reply_markup"]=msg.reply_markup
+                    m=await bot.copy_message(**kwargs)
+                    return uid,m.message_id,True
                 except Exception:
-                    async with counters_lock:failed+=1
+                    return uid,None,False
             except Forbidden:
-                async with counters_lock:failed+=1
                 set_status(uid,"inactive")
+                return uid,None,False
             except TelegramError as e:
-                async with counters_lock:failed+=1
                 logger.warning("Broadcast %s failed for %s: %s",bid,uid,e)
-            async with counters_lock:
-                progress["i"]+=1;i=progress["i"]
-            if i%10==0 or i==total:
-                try:await status_msg.edit_text(f"📣 <b>Broadcasting...</b>\n\n📤 Progress: <b>{i}/{total}</b>\n✅ Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>",reply_markup=safe_markup([[ib("⏹ Cancel Broadcast",f"a_cancelbc_{bid}",style="danger",emoji_id=EMOJI["❌"])] ]),parse_mode=ParseMode.HTML)
-                except TelegramError:pass
+                return uid,None,False
 
-    for chunk_start in range(0,total,CONCURRENCY):
-        if asyncio.current_task().cancelled():cancelled=True;break
-        chunk=recipient_list[chunk_start:chunk_start+CONCURRENCY]
-        await asyncio.gather(*(send_one(uid) for uid in chunk))
-    status="cancelled" if cancelled else "completed";bcast_update(bid,sent,failed,cancelled,status)
-    kb=safe_markup([[ib("🔁 Retry Failed",f"a_retrybc_{bid}",style="success",emoji_id=EMOJI["🌟"])],[ib("🗑 Delete Broadcast",f"a_delbc_{bid}",style="danger",emoji_id=EMOJI["❌"])],[back_button("a_bcast")]])
-    try:await status_msg.edit_text(f"{'⏹' if cancelled else '✅'} <b>Broadcast {status.title()}</b>\n\n📤 Total: <b>{len(recipient_list)}</b>\n✅ Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>",reply_markup=kb,parse_mode=ParseMode.HTML)
-    except TelegramError:pass
+    for chunk_start in range(0,total,BROADCAST_CHUNK_SIZE):
+        if asyncio.current_task().cancelled():
+            cancelled=True
+            break
+        chunk=recipient_list[chunk_start:chunk_start+BROADCAST_CHUNK_SIZE]
+        results=await asyncio.gather(*(send_one(uid) for uid in chunk))
+        successful_rows=[]
+        for uid,message_id,ok in results:
+            progress["i"]+=1
+            if ok:
+                sent+=1
+                successful_rows.append((bid,uid,message_id))
+            else:
+                failed+=1
+
+        if successful_rows:
+            with db() as c:
+                c.executemany("INSERT INTO broadcast_msgs(bcast_id,user_id,message_id) VALUES(?,?,?)",successful_rows)
+
+        i=progress["i"]
+        if i%BROADCAST_PROGRESS_EVERY==0 or i==total:
+            try:
+                await status_msg.edit_text(
+                    f"📣 <b>Broadcasting...</b>\\n\\n📤 Progress: <b>{i}/{total}</b>\\n✅ Sent: <b>{sent}</b>\\n❌ Failed: <b>{failed}</b>",
+                    reply_markup=safe_markup([[ib("⏹ Cancel Broadcast",f"a_cancelbc_{bid}",style="danger",emoji_id=EMOJI["❌"])] ]),
+                    parse_mode=ParseMode.HTML,
+                )
+            except TelegramError:
+                pass
+
+    status="cancelled" if cancelled else "completed"
+    bcast_update(bid,sent,failed,cancelled,status)
+    kb=safe_markup([
+        [ib("🔁 Retry Failed",f"a_retrybc_{bid}",style="success",emoji_id=EMOJI["🌟"])],
+        [ib("🗑 Delete Broadcast",f"a_delbc_{bid}",style="danger",emoji_id=EMOJI["❌"])],
+        [back_button("a_bcast")],
+    ])
+    try:
+        await status_msg.edit_text(
+            f"{'⏹' if cancelled else '✅'} <b>Broadcast {status.title()}</b>\\n\\n📤 Total: <b>{total}</b>\\n✅ Sent: <b>{sent}</b>\\n❌ Failed: <b>{failed}</b>",
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramError:
+        pass
 
 async def _bcast_send_without_button(update,ctx,msg):
     global BROADCAST_TASK
@@ -2104,13 +2219,13 @@ async def auto_backup_loop():
 async def _check_force_join_admin_rights(bot):
     rows=channels(False)
     if not rows:return
-    try:me=await bot.get_me()
+    try:bot_id=await get_cached_bot_id(bot)
     except TelegramError as e:
         logger.warning("ForceJoin channel admin check failed: %s",e);return
     for r in rows:
         cid=str(r[1]).strip()
         try:
-            m=await bot.get_chat_member(cid,me.id)
+            m=await bot.get_chat_member(cid,bot_id)
             status=str(getattr(m,"status","") or "").lower()
             if status not in ("administrator","creator"):
                 logger.warning("ForceJoin required channel %s (%s) does not grant the bot admin rights (status=%s). Telegram chat_member updates may not be delivered.",cid,r[2],status)
